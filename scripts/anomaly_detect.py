@@ -23,7 +23,7 @@ DEFAULT_DETECTORS: Dict[str, Dict[str, Any]] = {
     "robust_zscore": {"enabled": True, "min_data_points": 4, "threshold": 3.0, "confidence_base": 0.7, "extra": {}},
     "stl": {"enabled": True, "min_data_points": 9, "threshold": 4.0, "confidence_base": 0.7, "extra": {"period": 7}},
     "mann_kendall": {"enabled": True, "min_data_points": 5, "threshold": 1.96, "confidence_base": 0.7, "extra": {"min_change_pct": 0.05}},
-    "sliding_window_t": {"enabled": True, "min_data_points": 8, "threshold": 2.0, "confidence_base": 0.7, "extra": {}},
+    "sliding_window_t": {"enabled": True, "min_data_points": 8, "threshold": 2.0, "confidence_base": 0.7, "extra": {"min_change_pct": 0.10}},
     "isolation_forest": {"enabled": True, "min_data_points": 4, "confidence_base": 0.7, "extra": {"window_ratio": 0.25, "score_threshold": 0.65}},
 
 }
@@ -334,6 +334,8 @@ def detect_sliding_window_t(values: Sequence[float], cfg: Dict[str, Any]) -> Det
     min_data_points = int(cfg.get("min_data_points", 8))
     threshold = float(cfg.get("threshold", 2.0))
     confidence_base = float(cfg.get("confidence_base", 0.7))
+    extra = cfg.get("extra") or {}
+    min_change_pct = float(extra.get("min_change_pct", 0.10))
     n_total = len(values)
     if n_total < min_data_points:
         return _no_anomaly(name, "数据量不足")
@@ -351,17 +353,22 @@ def detect_sliding_window_t(values: Sequence[float], cfg: Dict[str, Any]) -> Det
     if se == 0:
         return _no_anomaly(name, "数据无差异")
     t_stat = (mean2 - mean1) / se
+    current = values[-1]
+    current_deviation_ratio = abs(current - mean1) / abs(mean1) if mean1 != 0 else 0.0
+    if current_deviation_ratio < min_change_pct:
+        return _no_anomaly(name, f"当前值偏离前窗均值{current_deviation_ratio * 100:.1f}%，低于最小发布门槛{min_change_pct * 100:.1f}%")
     if abs(t_stat) > threshold:
         confidence = _confidence_by_excess(abs(t_stat), threshold, confidence_base, scale=0.3)
-        change_pct = abs(mean2 - mean1) / abs(mean1) * 100 if mean1 != 0 else 0.0
+        current_deviation_pct = current_deviation_ratio * 100
+        window_change_pct = abs(mean2 - mean1) / abs(mean1) * 100 if mean1 != 0 else 0.0
         return DetectionResult(
             name,
             True,
             confidence,
             "均值位移",
             abs(t_stat),
-            f"近期数据均值从{_fmt_num(mean1)}变为{_fmt_num(mean2)}，变化{change_pct:.1f}%",
-            {"t_statistic": t_stat, "mean_before": mean1, "mean_after": mean2, "window_size": window_size, "threshold": threshold},
+            f"当前值{_fmt_num(current)}偏离前窗均值{_fmt_num(mean1)}，偏离{current_deviation_pct:.1f}%；近期窗口均值{_fmt_num(mean2)}，窗口变化{window_change_pct:.1f}%",
+            {"t_statistic": t_stat, "mean_before": mean1, "mean_after": mean2, "current": current, "current_deviation_ratio": current_deviation_ratio, "window_size": window_size, "threshold": threshold},
         )
     return _no_anomaly(name, "数值变化在正常范围内")
 
