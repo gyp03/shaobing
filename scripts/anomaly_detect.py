@@ -22,7 +22,7 @@ DEFAULT_DETECTORS: Dict[str, Dict[str, Any]] = {
     "yoy": {"enabled": True, "min_data_points": 5, "threshold": 0.5, "confidence_base": 0.7, "extra": {}},
     "robust_zscore": {"enabled": True, "min_data_points": 4, "threshold": 3.0, "confidence_base": 0.7, "extra": {}},
     "stl": {"enabled": True, "min_data_points": 9, "threshold": 4.0, "confidence_base": 0.7, "extra": {"period": 7}},
-    "mann_kendall": {"enabled": True, "min_data_points": 5, "threshold": 1.96, "confidence_base": 0.7, "extra": {"min_change_pct": 0.05}},
+    "mann_kendall": {"enabled": True, "min_data_points": 5, "threshold": 1.96, "confidence_base": 0.7, "extra": {"min_change_pct": 0.10}},
     "sliding_window_t": {"enabled": True, "min_data_points": 8, "threshold": 2.0, "confidence_base": 0.7, "extra": {"min_change_pct": 0.10}},
     "isolation_forest": {"enabled": True, "min_data_points": 4, "confidence_base": 0.7, "extra": {"window_ratio": 0.25, "score_threshold": 0.65}},
 
@@ -71,6 +71,14 @@ class SeriesAlert:
     convergence_notes: List[str]
 
 
+@dataclass
+class DetectorSuitability:
+    detector: str
+    score: float
+    suitable: bool
+    reason: str
+
+
 def _safe_float(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -107,6 +115,35 @@ def _confidence_by_excess(score: float, threshold: float, base: float, scale: fl
     if threshold <= 0:
         return 1.0
     return min(1.0, (score - threshold) / threshold * scale + base)
+
+
+def _clamp01(value: float) -> float:
+    return min(1.0, max(0.0, value))
+
+
+def _relative_change(value: float, base: float) -> float:
+    return abs(value - base) / abs(base) if base != 0 else 0.0
+
+
+def _mann_kendall_stats(values: Sequence[float]) -> Tuple[float, float, int]:
+    n = len(values)
+    s = 0
+    for i in range(n - 1):
+        for j in range(i + 1, n):
+            if values[j] > values[i]:
+                s += 1
+            elif values[j] < values[i]:
+                s -= 1
+    counts: Dict[float, int] = {}
+    for v in values:
+        counts[v] = counts.get(v, 0) + 1
+    tie_correction = sum(c * (c - 1) * (2 * c + 5) for c in counts.values())
+    var_s = (n * (n - 1) * (2 * n + 5) - tie_correction) / 18
+    if var_s == 0:
+        return 0.0, 0.0, s
+    z = s / math.sqrt(var_s)
+    tau = s / (n * (n - 1) / 2) if n > 1 else 0.0
+    return z, tau, s
 
 
 def _no_anomaly(detector: str, explanation: str) -> DetectionResult:
@@ -279,47 +316,34 @@ def detect_mann_kendall(values: Sequence[float], cfg: Dict[str, Any]) -> Detecti
     n = len(values)
     if n < min_data_points:
         return _no_anomaly(name, "数据量不足")
-    s = 0
-    for i in range(n - 1):
-        for j in range(i + 1, n):
-            if values[j] > values[i]:
-                s += 1
-            elif values[j] < values[i]:
-                s -= 1
-    counts: Dict[float, int] = {}
-    for v in values:
-        counts[v] = counts.get(v, 0) + 1
-    tie_correction = sum(c * (c - 1) * (2 * c + 5) for c in counts.values())
-    var_s = (n * (n - 1) * (2 * n + 5) - tie_correction) / 18
-    if var_s == 0:
+    z, tau, s = _mann_kendall_stats(values)
+    if z == 0 and tau == 0:
         return _no_anomaly(name, "方差为零")
-    z = s / math.sqrt(var_s)
-    tau = s / (n * (n - 1) / 2)
     if abs(z) > threshold:
-        prev_avg = mean(values[:-1]) if len(values) > 1 else values[-1]
-        change_pct = abs(values[-1] - prev_avg) / abs(prev_avg) if prev_avg != 0 else 0.0
-        if change_pct < min_change_pct:
-            return _no_anomaly(name, "变化幅度过小")
         split = max(1, n // 2)
         front_avg = mean(values[:split])
         recent_avg = mean(values[split:]) if split < n else values[-1]
+        current_deviation_pct = abs(values[-1] - front_avg) / abs(front_avg) if front_avg != 0 else 0.0
+        if current_deviation_pct < min_change_pct:
+            return _no_anomaly(name, f"当前值偏离前段均值{current_deviation_pct * 100:.1f}%，低于最小发布门槛{min_change_pct * 100:.1f}%")
         window_change_pct = abs(recent_avg - front_avg) / abs(front_avg) if front_avg != 0 else 0.0
         confidence = _confidence_by_excess(abs(z), threshold, confidence_base, scale=0.3)
         anomaly_type = "趋势上升" if z > 0 else "趋势下降"
-        direction = "高于" if z > 0 else "低于"
+        mean_direction = "高于" if recent_avg > front_avg else "低于" if recent_avg < front_avg else "持平于"
+        current_direction = "高于" if values[-1] > recent_avg else "低于" if values[-1] < recent_avg else "接近"
         return DetectionResult(
             name,
             True,
             confidence,
             anomaly_type,
             abs(z),
-            f"数据整体呈{anomaly_type}，近段均值{_fmt_num(recent_avg)}{direction}前段均值{_fmt_num(front_avg)}，当前值{_fmt_num(values[-1])}仍处于趋势后的区间",
+            f"数据整体呈{anomaly_type}，近段均值{_fmt_num(recent_avg)}{mean_direction}前段均值{_fmt_num(front_avg)}，当前值{_fmt_num(values[-1])}{current_direction}近段均值",
             {
                 "z_score": z,
                 "tau": tau,
                 "s": s,
                 "threshold": threshold,
-                "change_pct": change_pct,
+                "current_deviation_pct": current_deviation_pct,
                 "front_avg": front_avg,
                 "recent_avg": recent_avg,
                 "window_change_pct": window_change_pct,
@@ -444,8 +468,98 @@ def detect_isolation_forest(values: Sequence[float], cfg: Dict[str, Any], seed: 
     )
 
 
+def detector_suitability(values: Sequence[float], granularity: str, period_hint: int, detector: str, cfg: Dict[str, Any]) -> DetectorSuitability:
+    n = len(values)
+    current = values[-1] if values else 0.0
+    med = median(values) if values else 0.0
+    mad = median([abs(x - med) for x in values]) if values else 0.0
+    current_vs_median = _relative_change(current, med)
+    min_points = int(cfg.get("min_data_points", DEFAULT_DETECTORS[detector].get("min_data_points", 4)))
+    if n < min_points:
+        return DetectorSuitability(detector, 0.05, False, f"数据点不足({n}<{min_points})")
+
+    if detector == "yoy":
+        extra = cfg.get("extra") or {}
+        previous_defaults = {"minutely": 24 * 60, "hourly": 24, "daily": 1, "weekly": 1, "monthly": 1}
+        seasonal_defaults = {"minutely": 7 * 24 * 60, "hourly": 7 * 24, "daily": period_hint or 7, "weekly": period_hint or 4, "monthly": period_hint or 12}
+        previous_lag = max(1, int(extra.get("previous_lag", previous_defaults.get(granularity, 1))))
+        seasonal_lag = max(previous_lag, int(extra.get("seasonal_lag", seasonal_defaults.get(granularity, period_hint or 7))))
+        if n <= seasonal_lag:
+            return DetectorSuitability(detector, 0.10, False, "周期参考点不足")
+        previous = values[-1 - previous_lag]
+        seasonal = values[-1 - seasonal_lag]
+        if previous == 0 or seasonal == 0:
+            return DetectorSuitability(detector, 0.15, False, "周期参考值无效")
+        prev_change = (current - previous) / previous
+        seasonal_change = (current - seasonal) / seasonal
+        same_direction = (prev_change > 0 and seasonal_change > 0) or (prev_change < 0 and seasonal_change < 0)
+        score = _clamp01(min(abs(prev_change), abs(seasonal_change)) / max(float(cfg.get("threshold", 0.5)), 0.01))
+        return DetectorSuitability(detector, score, same_direction and score >= 0.60, "同环比同向且变化明显" if same_direction else "同环比方向不一致")
+
+    if detector == "robust_zscore":
+        if mad == 0:
+            return DetectorSuitability(detector, 0.20, False, "MAD为0，历史无有效波动")
+        robust_z = abs(0.6745 * (current - med) / mad)
+        score = _clamp01(max(robust_z / max(float(cfg.get("threshold", 3.0)), 0.01), current_vs_median / 0.10))
+        return DetectorSuitability(detector, score, score >= 0.60, "当前点相对历史中位数偏离明显")
+
+    if detector == "stl":
+        period = int((cfg.get("extra") or {}).get("period", period_hint or 7))
+        min_required = max(min_points, period + 2)
+        if n < min_required:
+            return DetectorSuitability(detector, 0.10, False, f"周期分解数据点不足({n}<{min_required})")
+        trend_span = _relative_change(values[-1], values[0])
+        score = _clamp01(max(current_vs_median / 0.10, trend_span / 0.15))
+        return DetectorSuitability(detector, score, score >= 0.60, "数据长度支持周期/趋势残差检测")
+
+    if detector == "mann_kendall":
+        z, tau, _s = _mann_kendall_stats(values)
+        split = max(1, n // 2)
+        front_avg = mean(values[:split])
+        current_deviation = _relative_change(current, front_avg)
+        threshold = max(float(cfg.get("threshold", 1.96)), 0.01)
+        score = _clamp01(max(abs(z) / threshold, abs(tau), current_deviation / 0.10))
+        suitable = abs(z) >= threshold and current_deviation >= float((cfg.get("extra") or {}).get("min_change_pct", 0.10))
+        return DetectorSuitability(detector, score, suitable, "持续趋势且当前值偏离前段均值线" if suitable else "趋势或当前偏离不足")
+
+    if detector == "sliding_window_t":
+        window_size = max(2, min(n // 4, 7))
+        if n < window_size * 2:
+            return DetectorSuitability(detector, 0.10, False, "前后窗口数据点不足")
+        first = list(values[-2 * window_size : -window_size])
+        second = list(values[-window_size:])
+        mean1 = mean(first)
+        current_deviation = _relative_change(current, mean1)
+        score = _clamp01(current_deviation / max(float((cfg.get("extra") or {}).get("min_change_pct", 0.10)), 0.01))
+        return DetectorSuitability(detector, score, score >= 1.0, "当前值偏离前窗均值线明显")
+
+    if detector == "isolation_forest":
+        score = _clamp01(max(current_vs_median / 0.10, 0.35 if n >= min_points else 0.0))
+        return DetectorSuitability(detector, score, score >= 0.60, "当前点相对整体分布可能孤立")
+
+    return DetectorSuitability(detector, 0.0, False, "未知算法")
+
+
+def select_detector_config(values: Sequence[float], granularity: str, period_hint: int, config: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], List[DetectorSuitability]]:
+    cfgs = json.loads(json.dumps(config or DEFAULT_DETECTORS, ensure_ascii=False))
+    candidates = [name for name in DETECTOR_ORDER if cfgs.get(name, DEFAULT_DETECTORS[name]).get("enabled", True)]
+    if not candidates:
+        candidates = list(DETECTOR_ORDER)
+        cfgs = json.loads(json.dumps(DEFAULT_DETECTORS, ensure_ascii=False))
+    scores = [detector_suitability(values, granularity, period_hint, name, cfgs.get(name, DEFAULT_DETECTORS[name])) for name in candidates]
+    selected = [item.detector for item in scores if item.suitable]
+    if not selected and scores:
+        selected = [max(scores, key=lambda item: item.score).detector]
+    for name in DETECTOR_ORDER:
+        if name in cfgs:
+            cfgs[name]["enabled"] = name in selected
+    return cfgs, scores
+
+
 def run_detectors(values: Sequence[float], granularity: str, period_hint: int, seed: int = 42, config: Optional[Dict[str, Any]] = None) -> List[DetectionResult]:
-    cfgs = config or DEFAULT_DETECTORS
+    cfgs, suitability = select_detector_config(values, granularity, period_hint, config)
+    selected = [item.detector for item in suitability if cfgs.get(item.detector, {}).get("enabled")]
+    print("[DETECTOR_SELECT] " + ", ".join(f"{item.detector}={item.score:.2f}{'*' if item.detector in selected else ''}({item.reason})" for item in suitability), flush=True)
     results: List[DetectionResult] = []
     for name in DETECTOR_ORDER:
         cfg = cfgs.get(name, DEFAULT_DETECTORS[name])

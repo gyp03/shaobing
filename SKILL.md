@@ -2,7 +2,7 @@
 name: anomaly-detection-algorithms
 description: Use this skill for project time-series metric anomaly detection, local algorithm explanations, JPG trend charts, and production/preproduction alert publishing based on metadata.
 allowed-tools: 
-disable: true
+disable: false
 ---
 
 # 算法异常检测
@@ -32,6 +32,13 @@ disable: true
 
 详细公式和默认参数见 `references/algorithm_rules.md`。
 
+## 算法适配选择
+
+- 未显式配置算法时，先基于序列长度、当前值偏离中位数、当前值偏离前窗/前段均值、周期参考点、趋势统计量等特征，为每个候选算法计算适配分。
+- 达到适合阈值的算法全部运行；若没有任何算法达到阈值，运行适配分最高的一个算法，确保不会出现“一个算法都不跑”。
+- 显式配置 `detection_algor`、`detectors` 或 `检测算法` 时，尊重配置，只在配置的算法集合内做适配选择。
+- 每次检测输出 `[DETECTOR_SELECT]` 日志，标记各算法适配分；带 `*` 的算法为本次实际运行算法。
+
 ## 脚本职责
 
 - `scripts/anomaly_detect.py`：本地异常检测、候选异常和生产口径收敛。
@@ -44,11 +51,12 @@ disable: true
 
 1. 识别时间列、维度列、指标列和时间粒度。
 2. 按维度组合拆分时间序列；无维度时按全局序列检测。
-3. 明确要求“周同比 + 日环比”时优先使用 `yoy`；明确要求全面检测时运行固定算法池。
-4. 每个算法输出 `is_anomaly`、`confidence`、`anomaly_type`、`anomaly_score`、`explanation`。
-5. 统一标记脚本产出结果为 `[算法检测]`；`[AI检测]` 仅表示外部 AI / 大模型检测。
-6. 对候选异常做生产口径收敛：低基数降权、高体量优先、持续趋势优先。
-7. 默认只输出最终告警和关键观察项，避免机械罗列全部候选波动。
+3. 若元数据显式配置 `detection_algor` / `检测算法`，只运行配置的算法；未配置时先做数据画像，为固定算法池打适配分，再运行适合算法。
+4. 算法选择必须至少选中一个算法：若所有算法均未达到适合阈值，选择适配分最高的算法，而不是固定兜底某个算法。
+5. 每个算法输出 `is_anomaly`、`confidence`、`anomaly_type`、`anomaly_score`、`explanation`。
+6. 统一标记脚本产出结果为 `[算法检测]`；`[AI检测]` 仅表示外部 AI / 大模型检测。
+7. 对候选异常做生产口径收敛：低基数降权、高体量优先、持续趋势优先。
+8. 默认只输出最终告警和关键观察项，避免机械罗列全部候选波动。
 
 示例：
 
@@ -204,6 +212,7 @@ python scripts/publish_anomaly_alerts.py data.tsv --time-col 日期 --dimension-
 
 - 高业务影响优先：历史均值、近期均值、绝对量大的维度优先。
 - 持续趋势优先：近 7 日均值、窗口均值位移或趋势检验明显时，优先于单日百分比突变。
+- Mann-Kendall 趋势检验默认要求“最新值相对前段均值线”的偏离幅度不低于 `10%`；低于该门槛的趋势变化只作为观察项，不发布告警。
 - 窗口均值位移默认要求“最新值相对前窗均值线”的偏离幅度不低于 `10%`；低于该门槛的稳定小波动即使 T 检验显著，也不发布告警。
 - 低基数降权：默认启用；`1 -> 2`、`2 -> 6`、`1 元 -> 6 元` 等默认降为观察项。
 - 比例类指标谨慎：分母或单量很小时，比例变化只作为辅助证据。
