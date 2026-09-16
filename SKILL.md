@@ -1,6 +1,7 @@
 ---
-name: anomaly-detection-algorithms
-description: Use this skill for project time-series metric anomaly detection, local algorithm explanations, JPG trend charts, and production/preproduction alert publishing based on metadata.
+name: jg-anomaly-detection-algorithms
+description: 用于项目时间序列指标异常检测、本地算法解释、JPG 趋势图生成，以及基于元数据的告警发布。
+author: MR.GUO
 allowed-tools: 
 disable: false
 ---
@@ -80,8 +81,9 @@ python scripts/anomaly_detect.py data.tsv --time-col 日期 --dimension-cols 城
 
 - X 轴时间、Y 轴指标值、指标折线和最新检测点。
 - 维度信息、异常等级、主触发算法和简短原因。
+- `threshold` 阈值告警图必须绘制该指标配置的全部上限和下限水平线，并标注原始阈值值。
 - 生产发布标题：`${业务名称}/${指标名称} 异常趋势图`。
-- 发布文件名：`${yyyymmddhhmiss}-${5位数字}.jpg`；发布模式下数字后缀必须由幂等键稳定生成。
+- 发布文件名：`${yyyymmddhhmiss}-${16位哈希}.jpg`；时间取自 `run_id`，哈希后缀取自幂等键，确保同一运行跨重试路径稳定并降低并发覆盖风险。
 
 示例：
 
@@ -142,9 +144,24 @@ python scripts/publish_anomaly_alerts.py data.tsv --time-col 日期 --dimension-
 - `severity_levels` / `发布等级`
 - `period` / `周期`
 - `low_base_downgrade` / `低基数降权`
-- `detectors` / `检测算法`
+- `detectors` / `检测算法` / `使用算法` / `detection_algor`
 
 自然语言阈值，如 `指标值超过3000就进行告警`，会作为该指标的发布门禁：当前值未命中阈值时，即使其他算法检测为异常也不发布；命中阈值时可发布自定义阈值告警，或放行已命中的算法告警。
+
+仅阈值监控：统一使用 `threshold` 作为配置和结果中的算法名。当元数据 `detection_algor` 或 `ex_prompt` 中的 `使用算法` / `检测算法` 配置为 `threshold` 或 `阈值` 时，不运行算法池，只根据阈值规则生成告警；该模式必须配置至少一条阈值规则，否则任务失败并提示补充规则。
+
+配置示例：
+
+```text
+detection_algor = threshold
+ex_prompt = 指标值超过3000就进行告警;发布等级=高
+```
+
+或：
+
+```text
+ex_prompt = 使用算法=threshold;指标值低于100就进行告警;发布等级=中
+```
 
 ### 结果表规则
 
@@ -258,7 +275,9 @@ python scripts/publish_anomaly_alerts.py data.tsv --time-col 日期 --dimension-
 - 使用 `grep` 做日志匹配时，若只是统计/观察，必须追加 `|| true`，避免“无匹配”导致命令以 exit code 1 被误判为任务失败。
 - Linux 示例：`PYTHONUNBUFFERED=1 python3 -u ... 2>&1 | tee /tmp/publish_run.log`。
 - Windows PowerShell 示例：`$env:PYTHONUNBUFFERED='1'; python -u ...`。
-- 脚本内部对 ODPS 长操作每 20 秒输出心跳。
+- 脚本内部对单次 ODPS 长操作每 20 秒输出心跳。
+- 禁止为等待数据或分区落地而创建轮询脚本（如 `/tmp/poll_part.py`），也禁止循环重复查询 ODPS。单次查询成功但返回 0 行时，立即输出 `[NO_DATA]`，将该元数据任务按无数据正常结束，不重试、不等待。
+- 只有网络、ODPS 执行异常等真实错误才允许按重试配置恢复；“查询无数据”不属于错误，不得触发重试。
 - Qoder Cloud Agent 是干净环境，写本地图表或中间文件前必须先创建父目录；尤其是 `output_dir/shaobing-uploaded-images/YYYYMMDD/*.jpg`，保存前必须 `mkdir -p` 对应日期目录。
 - 技能脚本统一使用 LF 行尾，避免云端编辑/patch 因 Windows CRLF 行尾失败；如发现 CRLF，先整体规范化行尾再修改。
 

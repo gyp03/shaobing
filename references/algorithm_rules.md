@@ -19,9 +19,9 @@ python scripts/anomaly_detect.py data.tsv --time-col 日期 --dimension-cols 城
 | `yoy` | 5 | 0.5 | 0.7 | `{}` |
 | `robust_zscore` | 4 | 3.0 | 0.7 | `{}` |
 | `stl` | 9 | 4.0 | 0.7 | `{period: 7}` |
-| `mann_kendall` | 5 | 1.96 | 0.7 | `{min_change_pct: 0.05}` |
-| `sliding_window_t` | 8 | 2.0 | 0.7 | `{}` |
-| `isolation_forest` | 4 | 1.5 | 0.7 | `{window_ratio: 0.25, score_threshold: 0.65}` |
+| `mann_kendall` | 5 | 1.96 | 0.7 | `{min_change_pct: 0.10}` |
+| `sliding_window_t` | 8 | 2.0 | 0.7 | `{min_change_pct: 0.10}` |
+| `isolation_forest` | 4 | - | 0.7 | `{window_ratio: 0.25, score_threshold: 0.65}` |
 
 ## 统一异常程度
 

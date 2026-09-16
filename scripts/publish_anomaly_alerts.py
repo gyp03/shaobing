@@ -329,9 +329,7 @@ def fmt_dims(dimensions: Dict[str, str]) -> str:
 
 
 def fmt_num(value: float) -> str:
-    if abs(value) >= 100 or float(value).is_integer():
-        return f"{value:.0f}"
-    return f"{value:.2f}"
+    return format(float(value), ".15g")
 
 
 def fmt_result_value(value: float) -> str:
@@ -345,6 +343,15 @@ def compact_text(text: str, limit: int = 500) -> str:
 
 def split_option_values(text: str) -> List[str]:
     return [part.strip() for part in re.split(r"[,，;；、/|\s]+", text or "") if part.strip()]
+
+
+def normalize_mode_token(text: str) -> str:
+    return re.sub(r"[\s_\-]+", "", str(text or "").strip().lower())
+
+
+def is_threshold_only_mode(detection_algor: str) -> bool:
+    tokens = {normalize_mode_token(part) for part in split_option_values(detection_algor)}
+    return bool(tokens & {"threshold", "阈值", "阈值告警"})
 
 
 def option_value(options: Dict[str, str], *keys: str) -> str:
@@ -393,7 +400,7 @@ def prompt_period(options: Dict[str, str], default_period: int) -> int:
 
 
 def _normalize_prompt_metric(text: str) -> str:
-    metric = re.sub(r"^(如果|当|若|当前|最新)", "", (text or "").strip())
+    metric = re.sub(r"^(?:(?:当前|最新|如果|当|若)\s*)+", "", (text or "").strip())
     if metric.endswith("指标值") and metric != "指标值":
         metric = metric[: -len("指标值")]
     if metric in {"", "指标", "指标值", "当前值", "数值", "值", "result"}:
@@ -408,7 +415,7 @@ def parse_prompt_threshold_rules(ex_prompt: str) -> List[PromptThresholdRule]:
     pattern = re.compile(
         r"(?:(?P<metric>[A-Za-z0-9_\u4e00-\u9fa5]+?)\s*)?"
         r"(?P<op>大于等于|小于等于|不低于|不少于|不超过|超过|大于|高于|低于|小于|少于|>=|<=|>|<)"
-        r"\s*(?P<threshold>-?\d+(?:\.\d+)?)"
+        r"\s*(?P<threshold>-?\d[\d,]*(?:\.\d+)?)"
     )
     op_map = {
         "超过": "gt",
@@ -438,7 +445,7 @@ def parse_prompt_threshold_rules(ex_prompt: str) -> List[PromptThresholdRule]:
                 metric=_normalize_prompt_metric(match.group("metric") or ""),
                 operator=operator,
                 operator_text=operator_text,
-                threshold=float(match.group("threshold")),
+                threshold=float(match.group("threshold").replace(",", "")),
                 severity=severity,
             )
         )
@@ -516,20 +523,23 @@ def build_prompt_threshold_alerts(
             value = det._safe_float(latest_row.get(metric))
             if value is None:
                 continue
-            for rule in rules:
-                if rule.metric and rule.metric != metric:
-                    continue
+            applicable_rules = metric_threshold_rules(metric, rules)
+            threshold_defs = [
+                {"operator": rule.operator, "operator_text": rule.operator_text, "threshold": rule.threshold}
+                for rule in applicable_rules
+            ]
+            for rule in applicable_rules:
                 if not threshold_rule_matches(value, rule):
                     continue
-                reason = f"个性化规则命中：当前值{fmt_num(value)}{rule.operator_text}{fmt_num(rule.threshold)}"
+                reason = f"当前值{fmt_num(value)}{rule.operator_text}{fmt_num(rule.threshold)}"
                 result = det.DetectionResult(
-                    "custom_threshold",
+                    "threshold",
                     True,
                     1.0,
-                    "自定义阈值",
+                    "阈值告警",
                     abs(value - rule.threshold),
                     reason,
-                    {"operator": rule.operator, "threshold": rule.threshold, "ex_prompt_rule": True},
+                    {"operator": rule.operator, "threshold": rule.threshold, "thresholds": threshold_defs, "ex_prompt_rule": True},
                 )
                 alerts.append(
                     det.SeriesAlert(
@@ -540,9 +550,9 @@ def build_prompt_threshold_alerts(
                         True,
                         rule.severity,
                         True,
-                        "custom_threshold",
+                        "threshold",
                         1.0,
-                        "自定义阈值",
+                        "阈值告警",
                         reason,
                         [result],
                         [result],
@@ -553,15 +563,45 @@ def build_prompt_threshold_alerts(
     return alerts
 
 
+def threshold_chart_lines(alert: det.SeriesAlert, ex_prompt: str = "") -> List[Tuple[str, float]]:
+    if alert.main_detector != "threshold":
+        return []
+    rules = metric_threshold_rules(alert.metric, parse_prompt_threshold_rules(ex_prompt))
+    if not rules and alert.triggered_detectors:
+        raw_thresholds = alert.triggered_detectors[0].raw.get("thresholds", [])
+        rules = [
+            PromptThresholdRule("", str(item.get("operator", "")), str(item.get("operator_text", "")), float(item["threshold"]), alert.severity)
+            for item in raw_thresholds
+            if isinstance(item, dict) and item.get("threshold") is not None
+        ]
+    lines: List[Tuple[str, float]] = []
+    for rule in rules:
+        label = "上限" if rule.operator in {"gt", "ge"} else "下限" if rule.operator in {"lt", "le"} else "阈值"
+        line = (label, rule.threshold)
+        if line not in lines:
+            lines.append(line)
+    return lines
+
+
+def stable_publish_time(run_id: str, source_time: str = "") -> datetime:
+    candidates = [run_id or "", source_time or ""]
+    for value in candidates:
+        digits = re.sub(r"\D", "", value)
+        for length, pattern in ((14, "%Y%m%d%H%M%S"), (8, "%Y%m%d")):
+            if len(digits) < length:
+                continue
+            try:
+                return datetime.strptime(digits[:length], pattern)
+            except ValueError:
+                continue
+    return datetime(1970, 1, 1)
+
+
 def build_chart_file_name(now: Optional[datetime] = None, stable_key: str = "") -> str:
-    """Build a retry-stable chart name while preserving the established file format."""
+    """Build a collision-resistant chart name that remains stable across retries."""
     now = now or datetime.now()
-    if stable_key:
-        timestamp = now.strftime("%Y%m%d") + "000000"
-        suffix = f"{int(stable_key[:12], 16) % 100000:05d}"
-    else:
-        timestamp = now.strftime("%Y%m%d%H%M%S")
-        suffix = f"{random.randint(0, 99999):05d}"
+    timestamp = now.strftime("%Y%m%d%H%M%S")
+    suffix = stable_key[:16].lower() if stable_key else f"{random.getrandbits(64):016x}"
     return f"{timestamp}-{suffix}.jpg"
 
 
@@ -763,6 +803,13 @@ from(
 ) t{dedupe_clause};"""
 
 
+def normalize_data_sql(sql_text: str) -> str:
+    sql = (sql_text or "").lstrip("\ufeff")
+    if re.match(r"^\s*et\s+odps\.", sql, re.IGNORECASE):
+        return re.sub(r"^(\s*)et(\s+odps\.)", r"\1set\2", sql, count=1, flags=re.IGNORECASE)
+    return sql
+
+
 def build_metadata_detail_sql(
     table: str,
     metadata_id: str,
@@ -812,8 +859,27 @@ def detect_selected_alerts(
     business_name: str,
     detector_config: Optional[Dict[str, Any]] = None,
     ex_prompt: str = "",
+    threshold_only: bool = False,
 ) -> List[det.SeriesAlert]:
     print_step(f"异常检测 | {business_name} | 指标={','.join(metric_cols)}")
+    threshold_rules = parse_prompt_threshold_rules(ex_prompt)
+    unknown_threshold_metrics = sorted({rule.metric for rule in threshold_rules if rule.metric and rule.metric not in metric_cols})
+    if unknown_threshold_metrics:
+        raise ValueError(
+            f"阈值规则指标不存在: {','.join(unknown_threshold_metrics)}；可用指标: {','.join(metric_cols)}"
+        )
+    if threshold_only:
+        if not threshold_rules:
+            raise ValueError("仅阈值模式需要在 ex_prompt 中配置阈值规则，例如：指标值超过3000就进行告警")
+        print_step(f"仅阈值模式 | {business_name} | 规则数={len(threshold_rules)}")
+        selected = [
+            alert
+            for alert in build_prompt_threshold_alerts(rows, time_col, dimension_cols, metric_cols, threshold_rules)
+            if alert.severity in publish_levels
+        ]
+        selected.sort(key=lambda a: (SEVERITY_RANK.get(a.severity, 0), a.confidence, abs(a.current_value)), reverse=True)
+        return selected
+
     alerts = det.analyze_table(
         rows,
         time_col=time_col,
@@ -825,7 +891,6 @@ def detect_selected_alerts(
         enable_low_base_downgrade=low_base_downgrade,
         detector_config=detector_config,
     )
-    threshold_rules = parse_prompt_threshold_rules(ex_prompt)
     selected: List[det.SeriesAlert] = []
     for alert in alerts:
         if not (alert.final_alert and alert.severity in publish_levels and alert.main_detector):
@@ -909,7 +974,7 @@ def publish_alerts_for_rows(
         if execute and not force_republish and idempotency_key in existing_keys:
             print_step(f"跳过已发布告警 | {business_name} | {dims} | {alert.metric} | key={idempotency_key[:12]}")
             continue
-        publish_time = datetime.now()
+        publish_time = stable_publish_time(run_id, alert.current_time)
         chart_file_name = build_chart_file_name(publish_time, stable_key=idempotency_key)
         object_name = build_oss_object_name(chart_file_name, publish_time)
         chart_path = output_dir / Path(object_name)
@@ -927,6 +992,7 @@ def publish_alerts_for_rows(
                 severity=alert.severity,
                 reason=alert.reason,
                 dimensions=dims,
+                threshold_lines=threshold_chart_lines(alert, ex_prompt),
             )
         img_url = ""
         if execute:
@@ -1039,12 +1105,16 @@ def process_metadata_item(
     prompt_options = parse_ex_prompt_options(meta.ex_prompt)
     if ex_prompt:
         print_step(f"个性化需求 | {business_label} | {ex_prompt}")
+    data_sql = normalize_data_sql(meta.data_sql)
+    if data_sql != meta.data_sql:
+        print_step(f"提数SQL规范化 | {business_label} | 修复开头 et odps 为 set odps")
     print_step(f"执行业务提数 | {business_label} | monitor_period={period_text}")
-    print_sql_block(f"提数SQL | {business_label}", meta.data_sql)
-    rows = query_odps_rows(meta.data_sql, config, label=f"提数SQL | {business_label}")
+    print_sql_block(f"提数SQL | {business_label}", data_sql)
+    rows = query_odps_rows(data_sql, config, label=f"提数SQL | {business_label}")
 
     business_name = args.business_name.strip() or meta.business_name or args.task_name
     if not rows:
+        print(f"[NO_DATA] {business_label} | 查询结果为空，不轮询、不重试", flush=True)
         publish_metadata_detail(args.detail_table, meta.id, business_name, config, args.execute)
         checkpoint.complete(meta.id)
         print(f"[CHECKPOINT] 元数据处理完成（无数据） | {business_label}")
@@ -1060,7 +1130,7 @@ def process_metadata_item(
         meta.metric_name,
         requested_metric_cols,
         exclude_cols=split_cols(requested_dimension_cols),
-        sql_text=meta.data_sql,
+        sql_text=data_sql,
     )
     dimension_cols = infer_dimension_cols(rows, time_col, metric_cols, requested_dimension_cols)
     print_step(
@@ -1069,8 +1139,9 @@ def process_metadata_item(
     )
     owner = meta.owner or args.owner
     task_name = build_task_title(business_name, args.task_name, args.publish_mode)
-    detection_algor = meta.detection_algor or option_value(prompt_options, "detectors", "检测算法", "算法") or args.detectors
-    detector_config = detector_config_from_text(detection_algor)
+    detection_algor = meta.detection_algor or option_value(prompt_options, "detectors", "检测算法", "使用算法", "detection_algor", "算法") or args.detectors
+    threshold_only = is_threshold_only_mode(detection_algor)
+    detector_config = None if threshold_only else detector_config_from_text(detection_algor)
     granularity = monitor_period_to_granularity(meta.monitor_period, args.granularity)
     effective_period = prompt_period(prompt_options, args.period)
     effective_low_base = prompt_low_base_downgrade(prompt_options, meta.ex_prompt, args.low_base_downgrade == "on")
@@ -1093,6 +1164,7 @@ def process_metadata_item(
             business_name=business_name,
             detector_config=detector_config,
             ex_prompt=ex_prompt,
+            threshold_only=threshold_only,
         )
         checkpoint.save_detected(meta.id, selected_alerts)
         if checkpoint.enabled:
@@ -1132,6 +1204,31 @@ def process_metadata_item(
     return published
 
 
+def is_retryable_metadata_error(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    try:
+        import requests
+
+        if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            return True
+        if isinstance(exc, requests.exceptions.HTTPError):
+            status = exc.response.status_code if exc.response is not None else 0
+            return status == 429 or status >= 500
+    except ImportError:
+        pass
+
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status == 429 or status >= 500
+    message = str(exc).lower()
+    transient_markers = (
+        "timeout", "timed out", "connection reset", "connection aborted", "connection refused",
+        "temporarily unavailable", "service unavailable", "too many requests", "throttl", "rate limit",
+    )
+    return any(marker in message for marker in transient_markers)
+
+
 def process_metadata_with_retry(
     meta: Any,
     args: argparse.Namespace,
@@ -1146,8 +1243,8 @@ def process_metadata_with_retry(
         try:
             return process_metadata_item(meta, args, config, output_dir, checkpoint, default_publish_levels)
         except Exception as exc:
-            if attempt >= attempts:
-                print(f"[TASK_FAILED] {business_label} | attempts={attempts} | {type(exc).__name__}: {exc}")
+            if attempt >= attempts or not is_retryable_metadata_error(exc):
+                print(f"[TASK_FAILED] {business_label} | attempts={attempt} | {type(exc).__name__}: {exc}")
                 raise
             wait_seconds = min(5 * attempt, 20)
             print(
@@ -1230,16 +1327,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[OUTPUT_DIR] {output_dir}", flush=True)
     config = load_config(args.config)
-    if args.execute and not args.from_metadata:
-        ensure_run_id(args)
+    ensure_run_id(args)
 
     if args.from_metadata:
         published = run_from_metadata(args, config, output_dir)
     else:
         rows = det.read_table(args.input)
         if not rows:
-            print("No data")
-            return 1
+            print("[NO_DATA] 输入数据为空，任务正常结束", flush=True)
+            print(f"[RUN_DONE] run_id={args.run_id} | execute={args.execute} | published=0", flush=True)
+            return 0
         time_col = infer_time_col(rows, args.time_col)
         metric_cols = infer_metric_cols(
             rows,

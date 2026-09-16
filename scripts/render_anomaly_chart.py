@@ -12,7 +12,7 @@ from statistics import median, mean
 from typing import List, Optional, Sequence, Tuple
 
 
-DETECTORS = {"yoy", "robust_zscore", "stl", "mann_kendall", "sliding_window_t", "isolation_forest", "custom_threshold"}
+DETECTORS = {"yoy", "robust_zscore", "stl", "mann_kendall", "sliding_window_t", "isolation_forest", "threshold"}
 FONT_CANDIDATES = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "Arial Unicode MS", "DejaVu Sans"]
 DETECTOR_NOTES = {
     "yoy": "同环比突变",
@@ -21,7 +21,7 @@ DETECTOR_NOTES = {
     "mann_kendall": "持续趋势",
     "sliding_window_t": "窗口均值位移",
     "isolation_forest": "孤立点",
-    "custom_threshold": "自定义阈值规则",
+    "threshold": "阈值规则",
 }
 SEVERITY_COLORS = {
     "高": ("#fee2e2", "#b91c1c"),
@@ -68,9 +68,7 @@ def read_series(path: Optional[str], time_col: str, metric_col: str) -> Tuple[Li
 
 
 def _fmt(value: float) -> str:
-    if abs(value) >= 100 or float(value).is_integer():
-        return f"{value:.0f}"
-    return f"{value:.2f}"
+    return format(float(value), ".15g")
 
 
 
@@ -118,6 +116,7 @@ def render_jpg(
     severity: str = "",
     reason: str = "",
     dimensions: str = "",
+    threshold_lines: Optional[Sequence[Tuple[str, float]]] = None,
     dpi: int = 120,
     quality: int = 92,
 ) -> None:
@@ -151,27 +150,16 @@ def render_jpg(
 
 
     x = list(range(len(values)))
+    threshold_lines = list(threshold_lines or [])
+    if threshold_lines:
+        y_values = list(values) + [line[1] for line in threshold_lines]
+        y_min, y_max = min(y_values), max(y_values)
+        y_pad = (y_max - y_min) * 0.12 or abs(y_max) * 0.1 or 1.0
+        ax.set_ylim(y_min - y_pad, y_max + y_pad)
     ax.grid(axis="y", color="#e5e7eb", linewidth=0.8)
     ax.plot(x, values, color="#2563eb", linewidth=2.2, marker="o", markersize=3.8)
     ax.scatter([x[-1]], [values[-1]], s=72, color="#ef4444", edgecolors="white", linewidths=1.4, zorder=5)
     ax.annotate(f"当前 {_fmt(values[-1])}", xy=(x[-1], values[-1]), xytext=(-12, 10), textcoords="offset points", color="#b91c1c", fontsize=10)
-
-    detector_notes = {
-        "yoy": "同环比突变",
-        "robust_zscore": "偏离中位数",
-        "stl": "趋势残差偏离",
-        "mann_kendall": "持续趋势",
-        "sliding_window_t": "窗口均值位移",
-        "isolation_forest": "孤立点",
-        "custom_threshold": "自定义阈值规则",
-    }
-
-    severity_colors = {
-        "高": ("#fee2e2", "#b91c1c"),
-        "中": ("#fef3c7", "#92400e"),
-        "低": ("#e0f2fe", "#075985"),
-        "无": ("#f3f4f6", "#4b5563"),
-    }
 
     if detector == "yoy":
         for idx, label in [(len(values) - 2, "前一参考点"), (len(values) - 1 - max(1, period), "上周期同期")]:
@@ -225,6 +213,12 @@ def render_jpg(
         ax.hlines(recent_mean, start, len(values) - 1, colors="#d97706", linestyles=(0, (6, 4)), linewidth=1.6)
         ax.text((start + len(values) - 1) / 2, ax.get_ylim()[1], "近期孤立窗口", ha="center", va="top", color="#92400e", fontsize=9)
         ax.text((start + len(values) - 1) / 2, recent_mean, f"近期均值 {_fmt(recent_mean)}", ha="center", va="bottom", color="#b45309", fontsize=9)
+    elif detector == "threshold":
+        for label, threshold_value in threshold_lines:
+            is_upper = "上限" in label or "高于" in label or ">" in label
+            color = "#dc2626" if is_upper else "#2563eb"
+            ax.axhline(threshold_value, color=color, linestyle=(0, (7, 4)), linewidth=1.7)
+            ax.text(x[-1], threshold_value, f"{label} {_fmt(threshold_value)}", ha="right", va="bottom", color=color, fontsize=9)
 
     ax.set_xticks(x)
     ax.set_xticklabels(times, rotation=45, ha="right", fontstyle="italic", fontsize=8.5, color="#6b7280")

@@ -72,6 +72,9 @@ _PROMPT_OPTION_ALIASES = {
         "low_base_downgrade": "low_base_downgrade",
         "lowbasedowngrade": "low_base_downgrade",
         "检测算法": "detectors",
+        "使用算法": "detectors",
+        "detection_algor": "detectors",
+        "detectionalgor": "detectors",
         "算法": "detectors",
         "detectors": "detectors",
     }.items()

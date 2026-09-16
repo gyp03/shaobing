@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone anomaly detector for the anomaly-detection-algorithms Skill.
+Standalone anomaly detector for the jg-anomaly-detection-algorithms Skill.
 
 Uses only Python standard library.
 """
@@ -92,9 +92,7 @@ def _safe_float(value: Any) -> Optional[float]:
 
 
 def _fmt_num(value: float) -> str:
-    if abs(value) >= 100 or float(value).is_integer():
-        return f"{value:.0f}"
-    return f"{value:.2f}"
+    return format(float(value), ".15g")
 
 
 def _population_std(values: Sequence[float]) -> float:
