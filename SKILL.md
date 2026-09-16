@@ -96,6 +96,8 @@ python scripts/render_anomaly_chart.py data.tsv --time-col 日期 --metric-col �
 
 默认只做本地检测和图表生成。只有用户明确要求“生产发布流程”“预生产发布流程”“上传 OSS 并写入 ODPS”“写入告警表”等，才使用发布脚本并加 `--execute`。
 
+同一用户请求或同一 Agent 会话只能执行一次带 `--execute` 的完整发布命令。发布脚本已经包含元数据查询、业务取数、异常检测、幂等校验、图表上传和结果写入，禁止在发布前后再执行另一遍完整发布进行“验证”。需要复核时只允许只读查询结果表；看到 `[RUN_DONE]` 后立即汇报并结束。
+
 ### 发布命令
 
 ```bash
@@ -175,12 +177,14 @@ ex_prompt = 使用算法=threshold;指标值低于100就进行告警;发布等�
 - `create_user`：使用元数据 `owner`。
 - 默认只发布 `中,高`；如 `ex_prompt` 配置 `severity_levels`，按配置发布。
 - `content` 必须写入 `analysis`、`source_time`、`run_id`、`idempotency_key`、`ex_prompt`、`publish_mode`、`pipeline_version`、`code_fingerprint` 等关键上下文，确保生产和预生产可校验是否同一代码版本。
+- `analysis` 智能分析必须在开头明确展示监测数据时间，例如 `监测时间：2026-09-16 08:00`，不得只显示告警生成时间。
 
 ### 幂等、断点和并行
 
 - 每次新的用户发布请求必须使用新 `run_id`，或省略让脚本自动生成。
 - 只有同一次任务因超时、断开或临时失败恢复时，才复用首次日志里的同一个 `run_id`。
-- 告警幂等键：`run_id + metadata_id + title + metric + dimensions + source_time` 的 SHA-256。
+- 告警幂等键是跨运行稳定的业务身份键：`title + metric + dimensions + source_time + publish_mode` 的 SHA-256；`run_id` 和可变化的元数据主键只用于执行追踪，不得参与业务防重。
+- 加载最近告警时同时兼容旧版包含 `run_id` 的幂等记录，并从 `detail/source_time/publish_mode` 重建业务身份，避免升级后重复发布历史监测数据。
 - 每个业务发布前只允许批量查询最近 30 天已有幂等状态；禁止逐告警查询 ODPS。
 - INSERT 必须带 `NOT EXISTS` 作为第二层防重。
 - 检查点默认在 `logs/checkpoints/`，仅 `--execute --from-metadata` 启用。
@@ -272,7 +276,7 @@ ex_prompt = 使用算法=threshold;指标值低于100就进行告警;发布等�
 - 禁止将发布命令直接接到 `tail -300`、`tail -n 300` 等等待 EOF 的管道。
 - 禁止使用 `sleep 60`、`sleep 90` 等静默等待；必须等待时每 10 秒输出心跳。
 - 等待后台进程时，禁止只执行 `kill -0 <pid>; sleep` 的静默轮询；必须在每轮输出 `WAIT pid=<pid> elapsed=<秒数>`，并可追加 `tail -n 5 /tmp/publish_run.log` 保持实时输出。
-- 等待逻辑必须优先识别日志完成标记：出现 `[RUN_DONE]` / `[SUMMARY]` / `[TASK_FAILED]` / `Traceback` 后应立即停止等待并读取最终日志，不要继续按 PID 空等。
+- 等待逻辑必须优先识别日志完成标记：成功时以 `[RUN_DONE]` 为最终完成标志；出现 `[TASK_FAILED]` / `Traceback` 时按失败结束。读取最终日志后立即汇报，禁止再次执行带 `--execute` 的发布命令。
 - 使用 `grep` 做日志匹配时，若只是统计/观察，必须追加 `|| true`，避免“无匹配”导致命令以 exit code 1 被误判为任务失败。
 - Linux 示例：`PYTHONUNBUFFERED=1 python3 -u ... 2>&1 | tee /tmp/publish_run.log`。
 - Windows PowerShell 示例：`$env:PYTHONUNBUFFERED='1'; python -u ...`。

@@ -341,6 +341,24 @@ def compact_text(text: str, limit: int = 500) -> str:
     return value if len(value) <= limit else value[:limit].rstrip() + "..."
 
 
+def format_monitor_time(value: str) -> str:
+    raw = compact_text(str(value or ""), limit=50)
+    digits = re.sub(r"\D", "", raw)
+    formats = {
+        14: ("%Y%m%d%H%M%S", "%Y-%m-%d %H:%M:%S"),
+        12: ("%Y%m%d%H%M", "%Y-%m-%d %H:%M"),
+        10: ("%Y%m%d%H", "%Y-%m-%d %H:00"),
+        8: ("%Y%m%d", "%Y-%m-%d"),
+    }
+    spec = formats.get(len(digits))
+    if spec:
+        try:
+            return datetime.strptime(digits, spec[0]).strftime(spec[1])
+        except ValueError:
+            pass
+    return raw or "未知"
+
+
 def split_option_values(text: str) -> List[str]:
     return [part.strip() for part in re.split(r"[,，;；、/|\s]+", text or "") if part.strip()]
 
@@ -695,17 +713,32 @@ def build_task_title(business_name: str, task_name: str, publish_mode: str) -> s
     return base_title
 
 
-def build_alert_idempotency_key(run_id: str, metadata_id: str, task_name: str, alert: det.SeriesAlert) -> str:
+def build_business_identity_key(
+    task_name: str,
+    metric: str,
+    dimensions: str,
+    source_time: str,
+    publish_mode: str,
+) -> str:
     payload = {
-        "run_id": run_id,
-        "metadata_id": str(metadata_id or ""),
         "title": task_name,
-        "metric": alert.metric,
-        "dimensions": sorted((str(k), str(v)) for k, v in alert.dimensions.items()),
-        "source_time": str(alert.current_time),
+        "metric": metric,
+        "dimensions": dimensions,
+        "source_time": source_time,
+        "publish_mode": publish_mode,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def build_alert_idempotency_key(task_name: str, alert: det.SeriesAlert, publish_mode: str) -> str:
+    return build_business_identity_key(
+        task_name,
+        alert.metric,
+        fmt_dims(alert.dimensions),
+        str(alert.current_time),
+        publish_mode,
+    )
 
 
 def load_published_identities(
@@ -716,11 +749,35 @@ def load_published_identities(
 ) -> set[str]:
     start_dt = (datetime.now() - timedelta(days=max(1, lookback_days))).strftime("%Y%m%d")
     sql = f"""SELECT GET_JSON_OBJECT(content, '$.idempotency_key') AS idempotency_key
+        ,GET_JSON_OBJECT(content, '$.source_time') AS source_time
+        ,GET_JSON_OBJECT(content, '$.publish_mode') AS publish_mode
+        ,GET_JSON_OBJECT(content, '$.detail') AS detail
+        ,metric_name
 FROM {table}
 WHERE dt >= {sql_str(start_dt)}
   AND title = {sql_str(task_name)};"""
     rows = query_odps_rows(sql, config, label=f"批量加载告警幂等状态 | {task_name}")
-    return {row.get("idempotency_key", "") for row in rows if row.get("idempotency_key", "")}
+    identities: set[str] = set()
+    default_mode = "preproduction" if task_name.startswith(PREPRODUCTION_TITLE_PREFIX) else "production"
+    for row in rows:
+        stored_key = row.get("idempotency_key", "")
+        if stored_key:
+            identities.add(stored_key)
+        detail_parts = row.get("detail", "").split("|", 2)
+        metric = row.get("metric_name", "") or (detail_parts[0] if detail_parts else "")
+        dimensions = detail_parts[1] if len(detail_parts) >= 2 else ""
+        source_time = row.get("source_time", "")
+        if metric and dimensions and source_time:
+            identities.add(
+                build_business_identity_key(
+                    task_name,
+                    metric,
+                    dimensions,
+                    source_time,
+                    row.get("publish_mode", "") or default_mode,
+                )
+            )
+    return identities
 
 
 def build_alert_sql(
@@ -744,7 +801,8 @@ def build_alert_sql(
     start_dt = (now - timedelta(days=max(1, lookback_days))).strftime("%Y%m%d")
     dimensions = fmt_dims(alert.dimensions)
     prompt_text = compact_text(ex_prompt)
-    analysis = f"[算法检测] {dimensions} / {alert.metric} 异常，当前值{fmt_num(alert.current_value)}。{alert.reason}"
+    monitor_time = format_monitor_time(alert.current_time)
+    analysis = f"[算法检测] 监测时间：{monitor_time}；{dimensions} / {alert.metric} 异常，当前值{fmt_num(alert.current_value)}。{alert.reason}"
     if prompt_text:
         analysis = f"{analysis}；个性化要求：{prompt_text}"
     detail = f"{alert.metric}|{dimensions}|{alert.reason}"
@@ -933,7 +991,6 @@ def publish_alerts_for_rows(
     execute: bool,
     detector_config: Optional[Dict[str, Any]] = None,
     ex_prompt: str = "",
-    metadata_id: str = "",
     run_id: str = "",
     publish_mode: str = "",
     pipeline_version: str = PIPELINE_VERSION,
@@ -970,7 +1027,7 @@ def publish_alerts_for_rows(
         if not times:
             continue
         dims = fmt_dims(alert.dimensions)
-        idempotency_key = build_alert_idempotency_key(run_id, metadata_id, task_name, alert)
+        idempotency_key = build_alert_idempotency_key(task_name, alert, publish_mode)
         if execute and not force_republish and idempotency_key in existing_keys:
             print_step(f"跳过已发布告警 | {business_name} | {dims} | {alert.metric} | key={idempotency_key[:12]}")
             continue
@@ -1188,7 +1245,6 @@ def process_metadata_item(
         execute=args.execute,
         detector_config=detector_config,
         ex_prompt=ex_prompt,
-        metadata_id=meta.id,
         run_id=args.run_id,
         publish_mode=args.publish_mode,
         pipeline_version=PIPELINE_VERSION,
