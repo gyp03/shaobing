@@ -19,8 +19,8 @@ python scripts/anomaly_detect.py data.tsv --time-col 日期 --dimension-cols 城
 | `yoy` | 5 | 0.5 | 0.7 | `{}` |
 | `robust_zscore` | 4 | 3.0 | 0.7 | `{}` |
 | `stl` | 9 | 4.0 | 0.7 | `{period: 7}` |
-| `mann_kendall` | 5 | 1.96 | 0.7 | `{min_change_pct: 0.10}` |
-| `sliding_window_t` | 8 | 2.0 | 0.7 | `{min_change_pct: 0.10}` |
+| `mann_kendall` | 5 | 1.96 | 0.7 | `{min_change_pct: 0.10, min_recent_deviation_pct: 0.10}` |
+| `sliding_window_t` | 8 | 2.0 | 0.7 | `{min_change_pct: 0.10, min_recent_deviation_pct: 0.10}` |
 | `isolation_forest` | 4 | - | 0.7 | `{window_ratio: 0.25, score_threshold: 0.65}` |
 
 ## 统一异常程度
@@ -152,17 +152,21 @@ s = sum(sign(values[j] - values[i])) for i < j
 var_s = Mann-Kendall variance with tie correction
 z = s / sqrt(var_s)
 tau = s / (n * (n - 1) / 2)
-change_pct = abs(current - avg(previous_values)) / avg(previous_values)
+front_change_pct = abs(current - front_avg) / abs(front_avg)
+recent_change_pct = abs(current - recent_avg) / abs(recent_avg)
 ```
 
 ### 异常条件
 
 ```text
 abs(z) > threshold
-且 change_pct >= min_change_pct
+且 front_change_pct >= min_change_pct
+且 recent_change_pct >= min_recent_deviation_pct
 ```
 
-默认：`threshold = 1.96`，`min_change_pct = 0.05`。
+不要求当前值方向与整体趋势一致。
+
+默认：`threshold = 1.96`，`min_change_pct = 0.10`，`min_recent_deviation_pct = 0.10`。
 
 ### confidence
 
@@ -186,15 +190,19 @@ mean1 = mean(first_window)
 mean2 = mean(second_window)
 se = sqrt(var(first_window) / n + var(second_window) / n)
 t_stat = (mean2 - mean1) / se
+front_change_pct = abs(current - mean1) / abs(mean1)
+recent_change_pct = abs(current - mean2) / abs(mean2)
 ```
 
 ### 异常条件
 
 ```text
 abs(t_stat) > threshold
+且 front_change_pct >= min_change_pct
+且 recent_change_pct >= min_recent_deviation_pct
 ```
 
-默认：`threshold = 2.0`。
+默认：`threshold = 2.0`，`min_change_pct = 0.10`，`min_recent_deviation_pct = 0.10`。
 
 ### confidence
 

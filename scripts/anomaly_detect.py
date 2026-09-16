@@ -22,8 +22,8 @@ DEFAULT_DETECTORS: Dict[str, Dict[str, Any]] = {
     "yoy": {"enabled": True, "min_data_points": 5, "threshold": 0.5, "confidence_base": 0.7, "extra": {}},
     "robust_zscore": {"enabled": True, "min_data_points": 4, "threshold": 3.0, "confidence_base": 0.7, "extra": {}},
     "stl": {"enabled": True, "min_data_points": 9, "threshold": 4.0, "confidence_base": 0.7, "extra": {"period": 7}},
-    "mann_kendall": {"enabled": True, "min_data_points": 5, "threshold": 1.96, "confidence_base": 0.7, "extra": {"min_change_pct": 0.10}},
-    "sliding_window_t": {"enabled": True, "min_data_points": 8, "threshold": 2.0, "confidence_base": 0.7, "extra": {"min_change_pct": 0.10}},
+    "mann_kendall": {"enabled": True, "min_data_points": 5, "threshold": 1.96, "confidence_base": 0.7, "extra": {"min_change_pct": 0.10, "min_recent_deviation_pct": 0.10}},
+    "sliding_window_t": {"enabled": True, "min_data_points": 8, "threshold": 2.0, "confidence_base": 0.7, "extra": {"min_change_pct": 0.10, "min_recent_deviation_pct": 0.10}},
     "isolation_forest": {"enabled": True, "min_data_points": 4, "confidence_base": 0.7, "extra": {"window_ratio": 0.25, "score_threshold": 0.65}},
 
 }
@@ -92,7 +92,9 @@ def _safe_float(value: Any) -> Optional[float]:
 
 
 def _fmt_num(value: float) -> str:
-    return format(float(value), ".15g")
+    number = float(value)
+    precision = 4 if 0 < abs(number) < 1 else 2
+    return f"{number:,.{precision}f}".rstrip("0").rstrip(".")
 
 
 def _population_std(values: Sequence[float]) -> float:
@@ -310,7 +312,8 @@ def detect_mann_kendall(values: Sequence[float], cfg: Dict[str, Any]) -> Detecti
     threshold = float(cfg.get("threshold", 1.96))
     confidence_base = float(cfg.get("confidence_base", 0.7))
     extra = cfg.get("extra") or {}
-    min_change_pct = float(extra.get("min_change_pct", 0.05))
+    min_change_pct = float(extra.get("min_change_pct", 0.10))
+    min_recent_deviation_pct = float(extra.get("min_recent_deviation_pct", min_change_pct))
     n = len(values)
     if n < min_data_points:
         return _no_anomaly(name, "数据量不足")
@@ -324,6 +327,12 @@ def detect_mann_kendall(values: Sequence[float], cfg: Dict[str, Any]) -> Detecti
         current_deviation_pct = abs(values[-1] - front_avg) / abs(front_avg) if front_avg != 0 else 0.0
         if current_deviation_pct < min_change_pct:
             return _no_anomaly(name, f"当前值偏离前段均值{current_deviation_pct * 100:.1f}%，低于最小发布门槛{min_change_pct * 100:.1f}%")
+        recent_deviation = (values[-1] - recent_avg) / abs(recent_avg) if recent_avg != 0 else 0.0
+        if abs(recent_deviation) < min_recent_deviation_pct:
+            return _no_anomaly(
+                name,
+                f"整体趋势显著，但当前值偏离近段均值仅{abs(recent_deviation) * 100:.1f}%，低于近期偏离门槛{min_recent_deviation_pct * 100:.1f}%",
+            )
         window_change_pct = abs(recent_avg - front_avg) / abs(front_avg) if front_avg != 0 else 0.0
         confidence = _confidence_by_excess(abs(z), threshold, confidence_base, scale=0.3)
         anomaly_type = "趋势上升" if z > 0 else "趋势下降"
@@ -358,6 +367,7 @@ def detect_sliding_window_t(values: Sequence[float], cfg: Dict[str, Any]) -> Det
     confidence_base = float(cfg.get("confidence_base", 0.7))
     extra = cfg.get("extra") or {}
     min_change_pct = float(extra.get("min_change_pct", 0.10))
+    min_recent_deviation_pct = float(extra.get("min_recent_deviation_pct", min_change_pct))
     n_total = len(values)
     if n_total < min_data_points:
         return _no_anomaly(name, "数据量不足")
@@ -375,24 +385,31 @@ def detect_sliding_window_t(values: Sequence[float], cfg: Dict[str, Any]) -> Det
     if se == 0:
         return _no_anomaly(name, "数据无差异")
     t_stat = (mean2 - mean1) / se
+    if abs(t_stat) <= threshold:
+        return _no_anomaly(name, "数值变化在正常范围内")
     current = values[-1]
     current_deviation_ratio = abs(current - mean1) / abs(mean1) if mean1 != 0 else 0.0
     if current_deviation_ratio < min_change_pct:
         return _no_anomaly(name, f"当前值偏离前窗均值{current_deviation_ratio * 100:.1f}%，低于最小发布门槛{min_change_pct * 100:.1f}%")
-    if abs(t_stat) > threshold:
-        confidence = _confidence_by_excess(abs(t_stat), threshold, confidence_base, scale=0.3)
-        current_deviation_pct = current_deviation_ratio * 100
-        window_change_pct = abs(mean2 - mean1) / abs(mean1) * 100 if mean1 != 0 else 0.0
-        return DetectionResult(
+    recent_deviation_ratio = abs(current - mean2) / abs(mean2) if mean2 != 0 else 0.0
+    if recent_deviation_ratio < min_recent_deviation_pct:
+        return _no_anomaly(
             name,
-            True,
-            confidence,
-            "均值位移",
-            abs(t_stat),
-            f"当前值{_fmt_num(current)}偏离前窗均值{_fmt_num(mean1)}，偏离{current_deviation_pct:.1f}%；近期窗口均值{_fmt_num(mean2)}，窗口变化{window_change_pct:.1f}%",
-            {"t_statistic": t_stat, "mean_before": mean1, "mean_after": mean2, "current": current, "current_deviation_ratio": current_deviation_ratio, "window_size": window_size, "threshold": threshold},
+            f"窗口均值位移显著，但当前值偏离近期窗口均值仅{recent_deviation_ratio * 100:.1f}%，低于近期偏离门槛{min_recent_deviation_pct * 100:.1f}%",
         )
-    return _no_anomaly(name, "数值变化在正常范围内")
+    confidence = _confidence_by_excess(abs(t_stat), threshold, confidence_base, scale=0.3)
+    current_deviation_pct = current_deviation_ratio * 100
+    recent_deviation_pct = recent_deviation_ratio * 100
+    window_change_pct = abs(mean2 - mean1) / abs(mean1) * 100 if mean1 != 0 else 0.0
+    return DetectionResult(
+        name,
+        True,
+        confidence,
+        "均值位移",
+        abs(t_stat),
+        f"当前值{_fmt_num(current)}偏离前窗均值{_fmt_num(mean1)}，偏离{current_deviation_pct:.1f}%；偏离近期窗口均值{_fmt_num(mean2)}，偏离{recent_deviation_pct:.1f}%；窗口变化{window_change_pct:.1f}%",
+        {"t_statistic": t_stat, "mean_before": mean1, "mean_after": mean2, "current": current, "current_deviation_ratio": current_deviation_ratio, "recent_deviation_ratio": recent_deviation_ratio, "window_size": window_size, "threshold": threshold},
+    )
 
 
 def _average_path_length(n: int) -> float:

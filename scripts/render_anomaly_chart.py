@@ -68,7 +68,9 @@ def read_series(path: Optional[str], time_col: str, metric_col: str) -> Tuple[Li
 
 
 def _fmt(value: float) -> str:
-    return format(float(value), ".15g")
+    number = float(value)
+    precision = 4 if 0 < abs(number) < 1 else 2
+    return f"{number:,.{precision}f}".rstrip("0").rstrip(".")
 
 
 
