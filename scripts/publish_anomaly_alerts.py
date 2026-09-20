@@ -482,6 +482,22 @@ def threshold_rule_matches(value: float, rule: PromptThresholdRule) -> bool:
     return False
 
 
+def build_threshold_reason(value: float, rule: PromptThresholdRule) -> str:
+    delta = round(abs(value - rule.threshold), 12)
+    is_upper = rule.operator in {"gt", "ge"}
+    boundary = "上限" if is_upper else "下限"
+    if delta == 0:
+        comparison = f"达到{boundary}"
+        delta_text = f"与{boundary}差值为0"
+    elif is_upper:
+        comparison = f"高于{boundary}"
+        delta_text = f"比{boundary}高{fmt_num(delta)}"
+    else:
+        comparison = f"低于{boundary}"
+        delta_text = f"比{boundary}低{fmt_num(delta)}"
+    return f"当前值{fmt_num(value)}{comparison}{fmt_num(rule.threshold)}，{delta_text}"
+
+
 def metric_threshold_rules(metric: str, rules: Sequence[PromptThresholdRule]) -> List[PromptThresholdRule]:
     return [rule for rule in rules if not rule.metric or rule.metric == metric]
 
@@ -549,7 +565,7 @@ def build_prompt_threshold_alerts(
             for rule in applicable_rules:
                 if not threshold_rule_matches(value, rule):
                     continue
-                reason = f"当前值{fmt_num(value)}{rule.operator_text}{fmt_num(rule.threshold)}"
+                reason = build_threshold_reason(value, rule)
                 result = det.DetectionResult(
                     "threshold",
                     True,
@@ -557,7 +573,7 @@ def build_prompt_threshold_alerts(
                     "阈值告警",
                     abs(value - rule.threshold),
                     reason,
-                    {"operator": rule.operator, "threshold": rule.threshold, "thresholds": threshold_defs, "ex_prompt_rule": True},
+                    {"operator": rule.operator, "threshold": rule.threshold, "threshold_delta": abs(value - rule.threshold), "thresholds": threshold_defs, "ex_prompt_rule": True},
                 )
                 alerts.append(
                     det.SeriesAlert(
