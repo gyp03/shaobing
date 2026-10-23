@@ -77,6 +77,20 @@ _PROMPT_OPTION_ALIASES = {
         "detectionalgor": "detectors",
         "算法": "detectors",
         "detectors": "detectors",
+        "three_sigma_threshold": "three_sigma_threshold",
+        "three_sigma_multiplier": "three_sigma_threshold",
+        "sigma_threshold": "three_sigma_threshold",
+        "3sigma阈值": "three_sigma_threshold",
+        "3σ阈值": "three_sigma_threshold",
+        "三西格玛阈值": "three_sigma_threshold",
+        "三倍标准差阈值": "three_sigma_threshold",
+        "标准差倍数": "three_sigma_threshold",
+        "σ倍数": "three_sigma_threshold",
+        "three_sigma_severity": "three_sigma_severity",
+        "three_sigma_alert_severity": "three_sigma_severity",
+        "3σ强制等级": "three_sigma_severity",
+        "三西格玛强制等级": "three_sigma_severity",
+        "强制等级": "three_sigma_severity",
     }.items()
 }
 
@@ -105,6 +119,12 @@ _DETECTOR_ALIASES = {
         "滑窗": "sliding_window_t",
         "isolation_forest": "isolation_forest",
         "孤立森林": "isolation_forest",
+        "three_sigma": "three_sigma",
+        "three-sigma": "three_sigma",
+        "3sigma": "three_sigma",
+        "3σ": "three_sigma",
+        "三西格玛": "three_sigma",
+        "三倍标准差": "three_sigma",
     }.items()
 }
 
@@ -404,14 +424,36 @@ def detector_config_from_text(text: str) -> Optional[Dict[str, Any]]:
             continue
         normalized = _DETECTOR_ALIASES.get(_normalize_prompt_key(token))
         if not normalized:
-            raise ValueError(f"未知检测算法: {token}，可选: {', '.join(det.DETECTOR_ORDER)}")
+            raise ValueError(f"未知检测算法: {token}，可选: {', '.join(det.CONFIGURABLE_DETECTOR_ORDER)}")
         if normalized not in selected:
             selected.append(normalized)
     if not selected:
         return None
-    config: Dict[str, Any] = json.loads(json.dumps(det.DEFAULT_DETECTORS, ensure_ascii=False))
-    for name in det.DETECTOR_ORDER:
+    config: Dict[str, Any] = json.loads(json.dumps(det.CONFIGURABLE_DETECTORS, ensure_ascii=False))
+    for name in det.CONFIGURABLE_DETECTOR_ORDER:
         config[name]["enabled"] = name in selected
+    return config
+
+
+def apply_detector_prompt_options(config: Optional[Dict[str, Any]], options: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    threshold_text = (options.get("three_sigma_threshold") or "").strip()
+    severity_text = (options.get("three_sigma_severity") or "").strip()
+    if not threshold_text and not severity_text:
+        return config
+    if config is None or not config.get("three_sigma", {}).get("enabled"):
+        raise ValueError("配置 3σ 参数时，必须同时配置 检测算法=three_sigma")
+    if threshold_text:
+        try:
+            threshold = float(threshold_text.replace(",", ""))
+        except ValueError as exc:
+            raise ValueError(f"3σ 阈值必须是数字，当前值: {threshold_text}") from exc
+        if threshold <= 0:
+            raise ValueError("3σ 阈值必须大于 0")
+        config["three_sigma"]["threshold"] = threshold
+    if severity_text:
+        if severity_text not in {"低", "中", "高"}:
+            raise ValueError(f"3σ 强制等级只支持 低/中/高，当前值: {severity_text}")
+        config["three_sigma"]["severity_override"] = severity_text
     return config
 
 
@@ -486,13 +528,51 @@ def metadata_period_condition(monitor_period: str) -> str:
     return f"monitor_period = {_sql_literal(period)}"
 
 
-def apply_metadata_period_filter(metadata_sql: str, monitor_period: str) -> str:
-    condition = metadata_period_condition(monitor_period)
-    if not condition:
+def metadata_filter_values(text: str) -> List[str]:
+    return [value.strip() for value in re.split(r"[,，;；、]+", text or "") if value.strip()]
+
+
+def _metadata_in_condition(column: str, values: Sequence[str]) -> str:
+    return f"{column} IN ({', '.join(_sql_literal(value) for value in values)})" if values else ""
+
+
+def apply_metadata_filters(
+    metadata_sql: str,
+    monitor_period: str = "",
+    metadata_ids: str = "",
+    business_names: str = "",
+    metric_names: str = "",
+) -> str:
+    conditions = [
+        metadata_period_condition(monitor_period),
+        _metadata_in_condition("CAST(id AS STRING)", metadata_filter_values(metadata_ids)),
+        _metadata_in_condition("business_name", metadata_filter_values(business_names)),
+        _metadata_in_condition("metric_name", metadata_filter_values(metric_names)),
+    ]
+    conditions = [condition for condition in conditions if condition]
+    if not conditions:
         return metadata_sql
     sql = metadata_sql.strip().rstrip(";").strip()
     connector = "AND" if re.search(r"\bwhere\b", sql, flags=re.IGNORECASE) else "WHERE"
-    return f"{sql}\n  {connector} {condition}\n;"
+    return f"{sql}\n  {connector} " + "\n  AND ".join(conditions) + "\n;"
+
+
+def apply_metadata_period_filter(metadata_sql: str, monitor_period: str) -> str:
+    return apply_metadata_filters(metadata_sql, monitor_period=monitor_period)
+
+
+def metadata_matches_filters(
+    metadata: BusinessMetadata,
+    metadata_ids: str = "",
+    business_names: str = "",
+    metric_names: str = "",
+) -> bool:
+    filters = (
+        (metadata.id, metadata_filter_values(metadata_ids)),
+        (metadata.business_name, metadata_filter_values(business_names)),
+        (metadata.metric_name, metadata_filter_values(metric_names)),
+    )
+    return all(not expected or actual in expected for actual, expected in filters)
 
 
 def monitor_period_to_granularity(text: str, default: str = "daily") -> str:

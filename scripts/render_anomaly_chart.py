@@ -12,7 +12,7 @@ from statistics import median, mean
 from typing import List, Optional, Sequence, Tuple
 
 
-DETECTORS = {"yoy", "robust_zscore", "stl", "mann_kendall", "sliding_window_t", "isolation_forest", "threshold"}
+DETECTORS = {"yoy", "robust_zscore", "stl", "mann_kendall", "sliding_window_t", "isolation_forest", "three_sigma", "threshold"}
 FONT_CANDIDATES = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "Arial Unicode MS", "DejaVu Sans"]
 DETECTOR_NOTES = {
     "yoy": "同环比突变",
@@ -21,6 +21,7 @@ DETECTOR_NOTES = {
     "mann_kendall": "持续趋势",
     "sliding_window_t": "窗口均值位移",
     "isolation_forest": "孤立点",
+    "three_sigma": "偏离历史均值3σ",
     "threshold": "阈值规则",
 }
 SEVERITY_COLORS = {
@@ -215,6 +216,24 @@ def render_jpg(
         ax.hlines(recent_mean, start, len(values) - 1, colors="#d97706", linestyles=(0, (6, 4)), linewidth=1.6)
         ax.text((start + len(values) - 1) / 2, ax.get_ylim()[1], "近期孤立窗口", ha="center", va="top", color="#92400e", fontsize=9)
         ax.text((start + len(values) - 1) / 2, recent_mean, f"近期均值 {_fmt(recent_mean)}", ha="center", va="bottom", color="#b45309", fontsize=9)
+    elif detector == "three_sigma":
+        history = list(values[:-1]) or list(values)
+        baseline_mean = mean(history)
+        baseline_std = (sum((value - baseline_mean) ** 2 for value in history) / len(history)) ** 0.5
+        if baseline_std:
+            upper_bound = baseline_mean + 3 * baseline_std
+            lower_bound = baseline_mean - 3 * baseline_std
+            ax.axhspan(lower_bound, upper_bound, color="#eef6ff", alpha=0.75)
+            ax.axhline(upper_bound, color="#dc2626", linestyle=(0, (5, 3)), linewidth=1.2)
+            ax.axhline(lower_bound, color="#dc2626", linestyle=(0, (5, 3)), linewidth=1.2)
+            y_min, y_max = ax.get_ylim()
+            label_pad = (y_max - y_min) * 0.04
+            if upper_bound + label_pad > y_max:
+                ax.set_ylim(y_min, upper_bound + label_pad)
+            ax.text(x[-1], upper_bound, f"上限 {_fmt(upper_bound)}", ha="right", va="bottom", color="#b91c1c", fontsize=9)
+            ax.text(x[-1], lower_bound, f"下限 {_fmt(lower_bound)}", ha="right", va="bottom", color="#b91c1c", fontsize=9)
+        ax.axhline(baseline_mean, color="#2563eb", linestyle=(0, (6, 4)), linewidth=1.3)
+        ax.text((x[0] + x[-1]) / 2, baseline_mean, f"历史均值 {_fmt(baseline_mean)}", ha="center", va="bottom", color="#1d4ed8", fontsize=9)
     elif detector == "threshold":
         for label, threshold_value in threshold_lines:
             is_upper = "上限" in label or "高于" in label or ">" in label

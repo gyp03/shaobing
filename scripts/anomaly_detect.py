@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone anomaly detector for the jg-anomaly-detection-algorithms Skill.
+Standalone anomaly detector for the ygcx-arch-anomaly-detection-algorithms Skill.
 
 Uses only Python standard library.
 """
@@ -25,7 +25,10 @@ DEFAULT_DETECTORS: Dict[str, Dict[str, Any]] = {
     "mann_kendall": {"enabled": True, "min_data_points": 5, "threshold": 1.96, "confidence_base": 0.7, "extra": {"min_change_pct": 0.10, "min_recent_deviation_pct": 0.10}},
     "sliding_window_t": {"enabled": True, "min_data_points": 8, "threshold": 2.0, "confidence_base": 0.7, "extra": {"min_change_pct": 0.10, "min_recent_deviation_pct": 0.10}},
     "isolation_forest": {"enabled": True, "min_data_points": 4, "confidence_base": 0.7, "extra": {"window_ratio": 0.25, "score_threshold": 0.65}},
+}
 
+EXPLICIT_ONLY_DETECTORS: Dict[str, Dict[str, Any]] = {
+    "three_sigma": {"enabled": True, "min_data_points": 4, "threshold": 3.0, "confidence_base": 0.7, "extra": {}},
 }
 
 DETECTOR_ORDER = [
@@ -36,6 +39,9 @@ DETECTOR_ORDER = [
     "sliding_window_t",
     "isolation_forest",
 ]
+EXPLICIT_ONLY_DETECTOR_ORDER = ["three_sigma"]
+CONFIGURABLE_DETECTORS: Dict[str, Dict[str, Any]] = {**DEFAULT_DETECTORS, **EXPLICIT_ONLY_DETECTORS}
+CONFIGURABLE_DETECTOR_ORDER = DETECTOR_ORDER + EXPLICIT_ONLY_DETECTOR_ORDER
 
 SEVERITY_RANK = {"无": 0, "低": 1, "中": 2, "高": 3}
 DETECTION_LABEL = "[算法检测]"
@@ -229,6 +235,50 @@ def detect_robust_zscore(values: Sequence[float], cfg: Dict[str, Any]) -> Detect
             {"robust_zscore": robust_z, "median": med, "mad": mad, "threshold": threshold},
         )
     return _no_anomaly(name, "数值正常，无异常")
+
+
+def detect_three_sigma(values: Sequence[float], cfg: Dict[str, Any]) -> DetectionResult:
+    name = "three_sigma"
+    min_data_points = int(cfg.get("min_data_points", 4))
+    threshold = float(cfg.get("threshold", 3.0))
+    confidence_base = float(cfg.get("confidence_base", 0.7))
+    if len(values) < min_data_points:
+        return _no_anomaly(name, "数据量不足")
+    history = list(values[:-1])
+    if not history:
+        return _no_anomaly(name, "缺少历史基准数据")
+    baseline_mean = mean(history)
+    baseline_std = _population_std(history)
+    if baseline_std == 0:
+        return _no_anomaly(name, "历史数据无波动")
+    current = values[-1]
+    z_score = (current - baseline_mean) / baseline_std
+    abs_z = abs(z_score)
+    if abs_z > threshold:
+        confidence = _confidence_by_excess(abs_z, threshold, confidence_base, scale=0.3)
+        anomaly_type = "尖峰异常" if z_score > 0 else "断崖下跌"
+        direction = "高于" if z_score > 0 else "低于"
+        change_pct = abs(current - baseline_mean) / abs(baseline_mean) * 100 if baseline_mean != 0 else 0.0
+        upper = baseline_mean + threshold * baseline_std
+        lower = baseline_mean - threshold * baseline_std
+        return DetectionResult(
+            name,
+            True,
+            confidence,
+            anomaly_type,
+            abs_z,
+            f"当前值{_fmt_num(current)}{direction}历史均值{_fmt_num(baseline_mean)}，偏离{change_pct:.1f}%；Z={abs_z:.2f}，超出{threshold:g}σ范围[{_fmt_num(lower)}, {_fmt_num(upper)}]",
+            {
+                "z_score": z_score,
+                "mean": baseline_mean,
+                "std": baseline_std,
+                "lower_bound": lower,
+                "upper_bound": upper,
+                "threshold": threshold,
+                "history_points": len(history),
+            },
+        )
+    return _no_anomaly(name, "当前值处于历史均值3σ范围内")
 
 
 def _moving_average_same(values: Sequence[float], window: int) -> List[float]:
@@ -489,7 +539,8 @@ def detector_suitability(values: Sequence[float], granularity: str, period_hint:
     med = median(values) if values else 0.0
     mad = median([abs(x - med) for x in values]) if values else 0.0
     current_vs_median = _relative_change(current, med)
-    min_points = int(cfg.get("min_data_points", DEFAULT_DETECTORS[detector].get("min_data_points", 4)))
+    default_cfg = CONFIGURABLE_DETECTORS.get(detector, {})
+    min_points = int(cfg.get("min_data_points", default_cfg.get("min_data_points", 4)))
     if n < min_points:
         return DetectorSuitability(detector, 0.05, False, f"数据点不足({n}<{min_points})")
 
@@ -552,20 +603,42 @@ def detector_suitability(values: Sequence[float], granularity: str, period_hint:
         score = _clamp01(max(current_vs_median / 0.10, 0.35 if n >= min_points else 0.0))
         return DetectorSuitability(detector, score, score >= 0.60, "当前点相对整体分布可能孤立")
 
+    if detector == "three_sigma":
+        history = list(values[:-1])
+        baseline_std = _population_std(history)
+        if baseline_std == 0:
+            return DetectorSuitability(detector, 0.20, False, "历史数据无有效波动")
+        z_score = abs(current - mean(history)) / baseline_std
+        score = _clamp01(z_score / max(float(cfg.get("threshold", 3.0)), 0.01))
+        return DetectorSuitability(detector, score, score >= 1.0, "当前值超出历史均值3σ范围" if score >= 1.0 else "当前值处于历史均值3σ范围内")
+
     return DetectorSuitability(detector, 0.0, False, "未知算法")
 
 
 def select_detector_config(values: Sequence[float], granularity: str, period_hint: int, config: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], List[DetectorSuitability]]:
+    explicit_config = config is not None
     cfgs = json.loads(json.dumps(config or DEFAULT_DETECTORS, ensure_ascii=False))
-    candidates = [name for name in DETECTOR_ORDER if cfgs.get(name, DEFAULT_DETECTORS[name]).get("enabled", True)]
+    candidates: List[str] = []
+    for name in CONFIGURABLE_DETECTOR_ORDER:
+        default_cfg = CONFIGURABLE_DETECTORS[name]
+        cfg = cfgs.get(name)
+        if cfg is None:
+            if explicit_config or name not in DEFAULT_DETECTORS:
+                continue
+            cfg = json.loads(json.dumps(default_cfg, ensure_ascii=False))
+            cfgs[name] = cfg
+        if cfg.get("enabled", default_cfg.get("enabled", False)):
+            candidates.append(name)
     if not candidates:
+        if explicit_config:
+            raise ValueError("显式配置未启用任何检测算法")
         candidates = list(DETECTOR_ORDER)
         cfgs = json.loads(json.dumps(DEFAULT_DETECTORS, ensure_ascii=False))
-    scores = [detector_suitability(values, granularity, period_hint, name, cfgs.get(name, DEFAULT_DETECTORS[name])) for name in candidates]
+    scores = [detector_suitability(values, granularity, period_hint, name, cfgs[name]) for name in candidates]
     selected = [item.detector for item in scores if item.suitable]
     if not selected and scores:
         selected = [max(scores, key=lambda item: item.score).detector]
-    for name in DETECTOR_ORDER:
+    for name in CONFIGURABLE_DETECTOR_ORDER:
         if name in cfgs:
             cfgs[name]["enabled"] = name in selected
     return cfgs, scores
@@ -576,9 +649,9 @@ def run_detectors(values: Sequence[float], granularity: str, period_hint: int, s
     selected = [item.detector for item in suitability if cfgs.get(item.detector, {}).get("enabled")]
     print("[DETECTOR_SELECT] " + ", ".join(f"{item.detector}={item.score:.2f}{'*' if item.detector in selected else ''}({item.reason})" for item in suitability), flush=True)
     results: List[DetectionResult] = []
-    for name in DETECTOR_ORDER:
-        cfg = cfgs.get(name, DEFAULT_DETECTORS[name])
-        if not cfg.get("enabled", True):
+    for name in CONFIGURABLE_DETECTOR_ORDER:
+        cfg = cfgs.get(name)
+        if not cfg or not cfg.get("enabled", False):
             continue
         if name == "yoy":
             result = detect_yoy(values, granularity, period_hint, cfg)
@@ -592,6 +665,8 @@ def run_detectors(values: Sequence[float], granularity: str, period_hint: int, s
             result = detect_sliding_window_t(values, cfg)
         elif name == "isolation_forest":
             result = detect_isolation_forest(values, cfg, seed=seed)
+        elif name == "three_sigma":
+            result = detect_three_sigma(values, cfg)
         else:
             continue
         results.append(result)

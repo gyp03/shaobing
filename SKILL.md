@@ -1,5 +1,5 @@
 ---
-name: jg-anomaly-detection-algorithms
+name: ygcx-arch-anomaly-detection-algorithms
 description: 用于项目时间序列指标异常检测、本地算法解释、JPG 趋势图生成，以及基于元数据的告警发布。
 author: MR.GUO
 allowed-tools: 
@@ -22,7 +22,7 @@ disable: false
 
 ## 固定算法池
 
-只能使用以下内置算法：
+默认自动适配只能使用以下内置算法：
 
 1. `yoy`：同环比突变检测。
 2. `robust_zscore`：稳健 Z-Score 检测。
@@ -30,6 +30,8 @@ disable: false
 4. `mann_kendall`：Mann-Kendall 趋势检验。
 5. `sliding_window_t`：滑动窗口 T 检验。
 6. `isolation_forest`：孤立森林检测。
+
+`three_sigma`（3σ）是显式配置专用算法：只有元数据 `detection_algor` 或 `ex_prompt` 明确配置 `three_sigma` / `3sigma` / `3σ` / `三西格玛` 时才运行，不进入默认自动算法池。
 
 详细公式和默认参数见 `references/algorithm_rules.md`。
 
@@ -82,6 +84,7 @@ python scripts/anomaly_detect.py data.tsv --time-col 日期 --dimension-cols 城
 - X 轴时间、Y 轴指标值、指标折线和最新检测点。
 - 维度信息、异常等级、主触发算法和简短原因。
 - `threshold` 阈值告警图必须绘制该指标配置的全部上限和下限水平线，并标注原始阈值值。
+- `three_sigma` 告警图必须绘制历史均值、`3σ` 上限和 `3σ` 下限；线条标签统一显示为“上限 <数值>”和“下限 <数值>”。
 - 图表和告警说明中的均值等普通数值最多保留两位小数；绝对值小于 `1` 时最多保留四位，避免冗长小数。
 - 生产发布标题：`${业务名称}/${指标名称} 异常趋势图`。
 - 发布文件名：`${yyyymmddhhmiss}-${16位哈希}.jpg`；时间取自 `run_id`，哈希后缀取自幂等键，确保同一运行跨重试路径稳定并降低并发覆盖风险。
@@ -107,6 +110,12 @@ python scripts/publish_anomaly_alerts.py --from-metadata --publish-mode producti
 # 日调度预生产发布：标题统一添加“预发测试-”
 python scripts/publish_anomaly_alerts.py --from-metadata --monitor-period 日调度 --publish-mode preproduction --execute
 
+# 只运行指定业务和指标；未传的过滤参数不限制
+python scripts/publish_anomaly_alerts.py --from-metadata --monitor-period 日调度 --metadata-business-name 价格采集 --metadata-metric-name 采集样本量 --publish-mode preproduction --execute
+
+# 只运行指定元数据 ID；多个值使用逗号分隔
+python scripts/publish_anomaly_alerts.py --from-metadata --metadata-id 10,11 --publish-mode preproduction --execute
+
 # 手动数据发布
 python scripts/publish_anomaly_alerts.py data.tsv --time-col 日期 --dimension-cols 城市 --metric-cols 订单量,GMV --task-name 算法异常检测告警 --business-name 订单监控 --publish-mode production --execute
 ```
@@ -126,6 +135,14 @@ python scripts/publish_anomaly_alerts.py data.tsv --time-col 日期 --dimension-
 
 每条元数据执行 `data_sql` 后再检测；无告警也要写检测明细表 `ygcx_dw_pro.ads_shaobing_busi_detect_detail`。
 
+支持在问答中指定元数据扫描范围：
+
+- “只运行元数据 ID 10”映射为 `--metadata-id 10`。
+- “只监控价格采集业务”映射为 `--metadata-business-name 价格采集`。
+- “只监控采集样本量指标”映射为 `--metadata-metric-name 采集样本量`。
+- 多个值使用逗号分隔；不同过滤项之间按 AND 组合。
+- 未指定的过滤项保持为空，不添加对应过滤条件，不得自行猜测。
+
 ### 列识别规则
 
 1. 显式配置优先：`ex_prompt` / 参数中的 `time_col`、`metric_cols`、`dimension_cols` 优先。
@@ -139,6 +156,8 @@ python scripts/publish_anomaly_alerts.py data.tsv --time-col 日期 --dimension-
 
 ### `ex_prompt` 配置
 
+完整填写说明和示例见 `references/ex_prompt_guide.md`。
+
 `ex_prompt` 可是自由文本，也可使用 JSON 或 `key=value`。支持键：
 
 - `time_col` / `时间列`
@@ -148,10 +167,14 @@ python scripts/publish_anomaly_alerts.py data.tsv --time-col 日期 --dimension-
 - `period` / `周期`
 - `low_base_downgrade` / `低基数降权`
 - `detectors` / `检测算法` / `使用算法` / `detection_algor`
+- `three_sigma_threshold` / `3σ阈值` / `标准差倍数`：仅在显式启用 `three_sigma` 时生效，默认 `3.0`
+- `three_sigma_severity` / `3σ强制等级` / `强制等级`：`three_sigma` 检测为异常时强制使用 `低/中/高` 等级；默认按 `confidence` 自动分级
 
 自然语言阈值，如 `指标值超过3000就进行告警`，会作为该指标的发布门禁：当前值未命中阈值时，即使其他算法检测为异常也不发布；命中阈值时可发布自定义阈值告警，或放行已命中的算法告警。阈值告警原因必须同时展示当前值、上限/下限及具体差值，例如 `当前值0.105低于下限0.1086，比下限低0.0036`。
 
 仅阈值监控：统一使用 `threshold` 作为配置和结果中的算法名。当元数据 `detection_algor` 或 `ex_prompt` 中的 `使用算法` / `检测算法` 配置为 `threshold` 或 `阈值` 时，不运行算法池，只根据阈值规则生成告警；该模式必须配置至少一条阈值规则，否则任务失败并提示补充规则。
+
+支持分段阈值和每段独立告警等级：同一段中的 `且` / `并且` 条件按 AND 组合，不同逗号、分号或句号分隔的规则按 OR 匹配；若多个规则同时命中，选择最高告警等级。边界语义严格遵循 `高于/低于`，不包含等于。
 
 配置示例：
 
@@ -165,6 +188,40 @@ ex_prompt = 指标值超过3000就进行告警;发布等级=高
 ```text
 ex_prompt = 使用算法=threshold;指标值低于100就进行告警;发布等级=中
 ```
+
+显式启用 3σ 示例：
+
+```text
+detection_algor = three_sigma
+```
+
+或：
+
+```text
+ex_prompt = 使用算法=three_sigma;发布等级=中,高
+```
+
+自定义 σ 倍数示例：
+
+```text
+ex_prompt = 使用算法=three_sigma;3σ阈值=2.5;发布等级=中,高
+```
+
+命中即高等级示例：
+
+```text
+ex_prompt = 使用算法=three_sigma;3σ阈值=2.5;3σ强制等级=高;发布等级=高
+```
+
+分段等级示例：
+
+```text
+ex_prompt = 指标值低于AAA就进行告警，告警等级为中;
+            指标值高于BBB且低于CCC就进行告警，告警等级为中;
+            指标值高于CCC就进行告警，告警等级为高
+```
+
+实际使用时将 `AAA`、`BBB`、`CCC` 替换为具体数字。
 
 ### 结果表规则
 
@@ -183,8 +240,9 @@ ex_prompt = 使用算法=threshold;指标值低于100就进行告警;发布等�
 
 - 每次新的用户发布请求必须使用新 `run_id`，或省略让脚本自动生成。
 - 只有同一次任务因超时、断开或临时失败恢复时，才复用首次日志里的同一个 `run_id`。
-- 告警幂等键是跨运行稳定的业务身份键：`title + metric + dimensions + source_time + publish_mode` 的 SHA-256；`run_id` 和可变化的元数据主键只用于执行追踪，不得参与业务防重。
-- 加载最近告警时同时兼容旧版包含 `run_id` 的幂等记录，并从 `detail/source_time/publish_mode` 重建业务身份，避免升级后重复发布历史监测数据。
+- 告警幂等键是跨运行稳定的业务身份键：`title + metric + dimensions + source_time + publish_mode + rule_fingerprint` 的 SHA-256；`run_id` 和可变化的元数据主键只用于执行追踪，不得参与业务防重。
+- `rule_fingerprint` 由实际检测器、告警等级、标准化后的阈值条件组和算法参数生成；修改阈值、区间、检测器、等级或 `three_sigma` 的 σ 倍数会视为新规则，允许针对同一监测时间重新发布；仅修改空格、标点、条件顺序或说明文字不会重复发布。
+- 加载最近告警时同时兼容旧版包含 `run_id` 的幂等记录，并从 `detail/source_time/publish_mode/ex_prompt/detector/severity` 重建业务身份，避免相同规则在升级后重复发布。
 - 每个业务发布前只允许批量查询最近 30 天已有幂等状态；禁止逐告警查询 ODPS。
 - INSERT 必须带 `NOT EXISTS` 作为第二层防重。
 - 检查点默认在 `logs/checkpoints/`，仅 `--execute --from-metadata` 启用。
@@ -197,6 +255,9 @@ ex_prompt = 使用算法=threshold;指标值低于100就进行告警;发布等�
 
 - `--from-metadata`：启用元数据驱动流程。
 - `--metadata-sql`：覆盖默认元数据 SQL。
+- `--metadata-id`：按元数据 `id` 精确过滤；多个值用逗号分隔，空值不过滤。
+- `--metadata-business-name`：按元数据 `business_name` 精确过滤；多个值用逗号分隔，空值不过滤。
+- `--metadata-metric-name`：按元数据 `metric_name` 精确过滤；多个值用逗号分隔，空值不过滤。
 - `--monitor-period`：只运行指定周期；`日调度` 会过滤 `monitor_period='日'`。
 - `--publish-mode`：`production` 或 `preproduction`。
 - `--metadata-workers`：元数据并行度，默认 `4`。

@@ -23,6 +23,14 @@ python scripts/anomaly_detect.py data.tsv --time-col 日期 --dimension-cols 城
 | `sliding_window_t` | 8 | 2.0 | 0.7 | `{min_change_pct: 0.10, min_recent_deviation_pct: 0.10}` |
 | `isolation_forest` | 4 | - | 0.7 | `{window_ratio: 0.25, score_threshold: 0.65}` |
 
+## 显式配置专用算法
+
+以下算法不进入默认自动算法池，只有元数据显式配置时才运行：
+
+| 算法 | min_data_points | threshold | confidence_base | extra |
+|---|---:|---:|---:|---|
+| `three_sigma` | 4 | 3.0 | 0.7 | `{}` |
+
 ## 统一异常程度
 
 异常程度不要只看百分比或 `confidence`，必须同时考虑绝对量、持续性和业务影响。
@@ -237,6 +245,61 @@ recent_score > score_threshold
 range_above = 1.0 - score_threshold
 confidence = confidence_base + (recent_score - score_threshold) / range_above * (1.0 - confidence_base)
 confidence = min(1.0, confidence)
+```
+
+## 7. `three_sigma`：3σ 检测
+
+### 适用
+
+适合业务明确要求使用标准差规则的场景。该算法不进入默认自动算法池，只能通过元数据 `detection_algor` 或 `ex_prompt` 显式启用。
+
+### 计算
+
+历史基准不包含当前值：
+
+```text
+history = values[:-1]
+mean = mean(history)
+std = population_std(history)
+z_score = (current - mean) / std
+lower = mean - threshold * std
+upper = mean + threshold * std
+```
+
+### 异常条件
+
+```text
+abs(z_score) > threshold
+```
+
+默认：`threshold = 3.0`，即当前值超出历史均值 `±3σ` 范围时告警。
+
+可在 `ex_prompt` 中按指标自定义 σ 倍数：
+
+```text
+检测算法=three_sigma;
+3σ阈值=2.5
+```
+
+此时异常条件为：
+
+```text
+abs(z_score) > 2.5
+```
+
+如需命中后固定为高等级，可配置：
+
+```text
+检测算法=three_sigma;
+3σ阈值=2.5;
+3σ强制等级=高;
+发布等级=高
+```
+
+### confidence
+
+```text
+confidence = min(1.0, (abs(z_score) - threshold) / threshold * 0.3 + confidence_base)
 ```
 
 ## 生产告警收敛规则

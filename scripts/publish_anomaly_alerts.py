@@ -24,12 +24,14 @@ import anomaly_detect as det
 import render_anomaly_chart as chart
 from metadata_loader import (
     DEFAULT_METADATA_SQL,
-    apply_metadata_period_filter,
+    apply_detector_prompt_options,
+    apply_metadata_filters,
     detector_config_from_text,
     infer_dimension_cols,
     infer_metric_cols,
     infer_time_col,
     load_active_metadata,
+    metadata_matches_filters,
     monitor_period_matches,
     monitor_period_to_granularity,
     parse_ex_prompt_options,
@@ -81,6 +83,7 @@ class PromptThresholdRule:
     operator_text: str
     threshold: float
     severity: str
+    group_id: int = 0
 
 
 class TeeStream:
@@ -428,8 +431,13 @@ def _normalize_prompt_metric(text: str) -> str:
 
 def parse_prompt_threshold_rules(ex_prompt: str) -> List[PromptThresholdRule]:
     text = ex_prompt or ""
-    severity_match = re.search(r"(?:发布等级|告警等级|severity_levels?)\s*[:=：]?\s*(高|中|低)", text, re.IGNORECASE)
-    severity = severity_match.group(1) if severity_match else ("高" if re.search(r"高危|高等级|严重|紧急", text) else "中")
+    severity_pattern = re.compile(
+        r"(?:发布等级|告警等级|severity_levels?)\s*(?:为|[:=：])?\s*(高|中|低)",
+        re.IGNORECASE,
+    )
+    severity_matches = list(severity_pattern.finditer(text))
+    global_severity = severity_matches[0].group(1) if len(severity_matches) == 1 else ""
+    default_severity = global_severity or ("高" if re.search(r"高危|高等级|严重|紧急", text) else "中")
     pattern = re.compile(
         r"(?:(?P<metric>[A-Za-z0-9_\u4e00-\u9fa5]+?)\s*)?"
         r"(?P<op>大于等于|小于等于|不低于|不少于|不超过|超过|大于|高于|低于|小于|少于|>=|<=|>|<)"
@@ -453,20 +461,47 @@ def parse_prompt_threshold_rules(ex_prompt: str) -> List[PromptThresholdRule]:
         "<=": "le",
     }
     rules: List[PromptThresholdRule] = []
-    for match in pattern.finditer(text):
-        operator_text = match.group("op")
-        operator = op_map.get(operator_text)
-        if not operator:
-            continue
-        rules.append(
-            PromptThresholdRule(
-                metric=_normalize_prompt_metric(match.group("metric") or ""),
-                operator=operator,
-                operator_text=operator_text,
-                threshold=float(match.group("threshold").replace(",", "")),
-                severity=severity,
-            )
+    group_id = 0
+    segments = [part.strip() for part in re.split(r"[;；。\n]+", text) if part.strip()]
+    for segment in segments:
+        segment_severity_match = severity_pattern.search(segment)
+        severity = (
+            segment_severity_match.group(1)
+            if segment_severity_match and len(severity_matches) > 1
+            else default_severity
         )
+        condition_text = severity_pattern.sub("", segment)
+        conditions = [
+            part.strip(" ，,")
+            for part in re.split(r"(?<!\d)[,，]|[,，](?!\d)", condition_text)
+            if part.strip(" ，,")
+        ]
+        for condition in conditions:
+            condition = re.sub(r"(?:则?就?)?(?:进行)?告警.*$", "", condition).strip()
+            condition = re.sub(r"(?:并且|而且|同时|且|并)\s*", " ", condition)
+            matches = list(pattern.finditer(condition))
+            if not matches:
+                continue
+            group_id += 1
+            group_metric = ""
+            for match in matches:
+                operator_text = match.group("op")
+                operator = op_map.get(operator_text)
+                if not operator:
+                    continue
+                parsed_metric = _normalize_prompt_metric(match.group("metric") or "")
+                if parsed_metric:
+                    group_metric = parsed_metric
+                rules.append(
+                    PromptThresholdRule(
+                        metric=parsed_metric or group_metric,
+                        operator=operator,
+                        operator_text=operator_text,
+                        threshold=float(match.group("threshold").replace(",", "")),
+                        severity=severity,
+                        group_id=group_id,
+                    )
+                )
     return rules
 
 
@@ -498,13 +533,53 @@ def build_threshold_reason(value: float, rule: PromptThresholdRule) -> str:
     return f"当前值{fmt_num(value)}{comparison}{fmt_num(rule.threshold)}，{delta_text}"
 
 
+def build_threshold_group_reason(value: float, group: Sequence[PromptThresholdRule]) -> str:
+    if len(group) == 1:
+        return build_threshold_reason(value, group[0])
+    lower_rules = [rule for rule in group if rule.operator in {"gt", "ge"}]
+    upper_rules = [rule for rule in group if rule.operator in {"lt", "le"}]
+    if len(lower_rules) == 1 and len(upper_rules) == 1:
+        lower, upper = lower_rules[0], upper_rules[0]
+        lower_delta = round(value - lower.threshold, 12)
+        upper_delta = round(upper.threshold - value, 12)
+        left_bracket = "(" if lower.operator == "gt" else "["
+        right_bracket = ")" if upper.operator == "lt" else "]"
+        return (
+            f"当前值{fmt_num(value)}位于告警区间"
+            f"{left_bracket}{fmt_num(lower.threshold)}, {fmt_num(upper.threshold)}{right_bracket}，"
+            f"比区间下限高{fmt_num(lower_delta)}，比区间上限低{fmt_num(upper_delta)}"
+        )
+    return "；".join(build_threshold_reason(value, rule) for rule in group)
+
+
+def threshold_rule_groups(rules: Sequence[PromptThresholdRule]) -> List[List[PromptThresholdRule]]:
+    grouped: Dict[int, List[PromptThresholdRule]] = {}
+    for index, rule in enumerate(rules, start=1):
+        key = rule.group_id if rule.group_id > 0 else -index
+        grouped.setdefault(key, []).append(rule)
+    return list(grouped.values())
+
+
+def metric_threshold_rule_groups(metric: str, rules: Sequence[PromptThresholdRule]) -> List[List[PromptThresholdRule]]:
+    applicable: List[List[PromptThresholdRule]] = []
+    for group in threshold_rule_groups(rules):
+        explicit_metrics = {rule.metric for rule in group if rule.metric}
+        if not explicit_metrics or metric in explicit_metrics:
+            applicable.append(group)
+    return applicable
+
+
 def metric_threshold_rules(metric: str, rules: Sequence[PromptThresholdRule]) -> List[PromptThresholdRule]:
-    return [rule for rule in rules if not rule.metric or rule.metric == metric]
+    return [rule for group in metric_threshold_rule_groups(metric, rules) for rule in group]
+
+
+def threshold_group_matches(value: float, group: Sequence[PromptThresholdRule]) -> bool:
+    return bool(group) and all(threshold_rule_matches(value, rule) for rule in group)
 
 
 def threshold_rules_allow_value(metric: str, value: float, rules: Sequence[PromptThresholdRule]) -> bool:
-    applicable_rules = metric_threshold_rules(metric, rules)
-    return not applicable_rules or any(threshold_rule_matches(value, rule) for rule in applicable_rules)
+    applicable_groups = metric_threshold_rule_groups(metric, rules)
+    return not applicable_groups or any(threshold_group_matches(value, group) for group in applicable_groups)
 
 
 def safe_name(text: str) -> str:
@@ -557,43 +632,55 @@ def build_prompt_threshold_alerts(
             value = det._safe_float(latest_row.get(metric))
             if value is None:
                 continue
-            applicable_rules = metric_threshold_rules(metric, rules)
+            applicable_groups = metric_threshold_rule_groups(metric, rules)
             threshold_defs = [
-                {"operator": rule.operator, "operator_text": rule.operator_text, "threshold": rule.threshold}
-                for rule in applicable_rules
+                {
+                    "operator": rule.operator,
+                    "operator_text": rule.operator_text,
+                    "threshold": rule.threshold,
+                    "severity": rule.severity,
+                    "group_id": rule.group_id,
+                }
+                for group in applicable_groups
+                for rule in group
             ]
-            for rule in applicable_rules:
-                if not threshold_rule_matches(value, rule):
-                    continue
-                reason = build_threshold_reason(value, rule)
-                result = det.DetectionResult(
-                    "threshold",
+            matched_groups = [group for group in applicable_groups if threshold_group_matches(value, group)]
+            if not matched_groups:
+                continue
+            group = max(
+                matched_groups,
+                key=lambda item: max(SEVERITY_RANK.get(rule.severity, 0) for rule in item),
+            )
+            severity = max(group, key=lambda rule: SEVERITY_RANK.get(rule.severity, 0)).severity
+            reason = build_threshold_group_reason(value, group)
+            threshold_delta = min(abs(value - rule.threshold) for rule in group)
+            result = det.DetectionResult(
+                "threshold",
+                True,
+                1.0,
+                "阈值告警",
+                threshold_delta,
+                reason,
+                {"threshold_delta": threshold_delta, "thresholds": threshold_defs, "matched_group_id": group[0].group_id, "ex_prompt_rule": True},
+            )
+            alerts.append(
+                det.SeriesAlert(
+                    dimensions,
+                    metric,
+                    current_time,
+                    value,
                     True,
+                    severity,
+                    True,
+                    "threshold",
                     1.0,
                     "阈值告警",
-                    abs(value - rule.threshold),
                     reason,
-                    {"operator": rule.operator, "threshold": rule.threshold, "threshold_delta": abs(value - rule.threshold), "thresholds": threshold_defs, "ex_prompt_rule": True},
+                    [result],
+                    [result],
+                    ["命中 ex_prompt 个性化阈值规则"],
                 )
-                alerts.append(
-                    det.SeriesAlert(
-                        dimensions,
-                        metric,
-                        current_time,
-                        value,
-                        True,
-                        rule.severity,
-                        True,
-                        "threshold",
-                        1.0,
-                        "阈值告警",
-                        reason,
-                        [result],
-                        [result],
-                        ["命中 ex_prompt 个性化阈值规则"],
-                    )
-                )
-                break
+            )
     return alerts
 
 
@@ -604,17 +691,33 @@ def threshold_chart_lines(alert: det.SeriesAlert, ex_prompt: str = "") -> List[T
     if not rules and alert.triggered_detectors:
         raw_thresholds = alert.triggered_detectors[0].raw.get("thresholds", [])
         rules = [
-            PromptThresholdRule("", str(item.get("operator", "")), str(item.get("operator_text", "")), float(item["threshold"]), alert.severity)
+            PromptThresholdRule(
+                "",
+                str(item.get("operator", "")),
+                str(item.get("operator_text", "")),
+                float(item["threshold"]),
+                str(item.get("severity", alert.severity)),
+                int(item.get("group_id", 0) or 0),
+            )
             for item in raw_thresholds
             if isinstance(item, dict) and item.get("threshold") is not None
         ]
-    lines: List[Tuple[str, float]] = []
-    for rule in rules:
-        label = "上限" if rule.operator in {"gt", "ge"} else "下限" if rule.operator in {"lt", "le"} else "阈值"
-        line = (label, rule.threshold)
-        if line not in lines:
-            lines.append(line)
-    return lines
+    labels_by_value: Dict[float, List[str]] = {}
+    for group in threshold_rule_groups(rules):
+        is_interval = (
+            any(rule.operator in {"gt", "ge"} for rule in group)
+            and any(rule.operator in {"lt", "le"} for rule in group)
+        )
+        for rule in group:
+            if is_interval:
+                boundary = "区间下限" if rule.operator in {"gt", "ge"} else "区间上限"
+            else:
+                boundary = "上限" if rule.operator in {"gt", "ge"} else "下限"
+            label = f"{rule.severity}等级{boundary}"
+            labels = labels_by_value.setdefault(rule.threshold, [])
+            if label not in labels:
+                labels.append(label)
+    return [("/".join(labels), value) for value, labels in labels_by_value.items()]
 
 
 def stable_publish_time(run_id: str, source_time: str = "") -> datetime:
@@ -729,12 +832,44 @@ def build_task_title(business_name: str, task_name: str, publish_mode: str) -> s
     return base_title
 
 
+def build_rule_fingerprint(metric: str, detector: str, severity: str, ex_prompt: str) -> str:
+    canonical_groups: List[Dict[str, Any]] = []
+    for group in metric_threshold_rule_groups(metric, parse_prompt_threshold_rules(ex_prompt)):
+        conditions = sorted(
+            (
+                rule.operator,
+                format(float(rule.threshold), ".15g"),
+            )
+            for rule in group
+        )
+        group_severity = max(group, key=lambda rule: SEVERITY_RANK.get(rule.severity, 0)).severity
+        canonical_groups.append({"conditions": conditions, "severity": group_severity})
+    canonical_groups.sort(key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True))
+    detector_params: Dict[str, Any] = {}
+    sigma_threshold = parse_ex_prompt_options(ex_prompt).get("three_sigma_threshold", "")
+    if sigma_threshold:
+        try:
+            canonical_threshold = format(float(sigma_threshold.replace(",", "")), ".15g")
+        except ValueError:
+            canonical_threshold = sigma_threshold.strip()
+        detector_params["three_sigma"] = {"threshold": canonical_threshold}
+    payload = {
+        "detector": detector,
+        "severity": severity,
+        "threshold_groups": canonical_groups,
+        "detector_params": detector_params,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def build_business_identity_key(
     task_name: str,
     metric: str,
     dimensions: str,
     source_time: str,
     publish_mode: str,
+    rule_fingerprint: str,
 ) -> str:
     payload = {
         "title": task_name,
@@ -742,18 +877,20 @@ def build_business_identity_key(
         "dimensions": dimensions,
         "source_time": source_time,
         "publish_mode": publish_mode,
+        "rule_fingerprint": rule_fingerprint,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def build_alert_idempotency_key(task_name: str, alert: det.SeriesAlert, publish_mode: str) -> str:
+def build_alert_idempotency_key(task_name: str, alert: det.SeriesAlert, publish_mode: str, ex_prompt: str) -> str:
     return build_business_identity_key(
         task_name,
         alert.metric,
         fmt_dims(alert.dimensions),
         str(alert.current_time),
         publish_mode,
+        build_rule_fingerprint(alert.metric, alert.main_detector, alert.severity, ex_prompt),
     )
 
 
@@ -768,7 +905,12 @@ def load_published_identities(
         ,GET_JSON_OBJECT(content, '$.source_time') AS source_time
         ,GET_JSON_OBJECT(content, '$.publish_mode') AS publish_mode
         ,GET_JSON_OBJECT(content, '$.detail') AS detail
+        ,GET_JSON_OBJECT(content, '$.dimensions') AS dimensions
+        ,GET_JSON_OBJECT(content, '$.detector') AS detector
+        ,GET_JSON_OBJECT(content, '$.ex_prompt') AS ex_prompt
+        ,GET_JSON_OBJECT(content, '$.rule_fingerprint') AS rule_fingerprint
         ,metric_name
+        ,severity
 FROM {table}
 WHERE dt >= {sql_str(start_dt)}
   AND title = {sql_str(task_name)};"""
@@ -781,9 +923,15 @@ WHERE dt >= {sql_str(start_dt)}
             identities.add(stored_key)
         detail_parts = row.get("detail", "").split("|", 2)
         metric = row.get("metric_name", "") or (detail_parts[0] if detail_parts else "")
-        dimensions = detail_parts[1] if len(detail_parts) >= 2 else ""
+        dimensions = row.get("dimensions", "") or (detail_parts[1] if len(detail_parts) >= 2 else "")
         source_time = row.get("source_time", "")
         if metric and dimensions and source_time:
+            rule_fingerprint = row.get("rule_fingerprint", "") or build_rule_fingerprint(
+                metric,
+                row.get("detector", ""),
+                row.get("severity", ""),
+                row.get("ex_prompt", ""),
+            )
             identities.add(
                 build_business_identity_key(
                     task_name,
@@ -791,6 +939,7 @@ WHERE dt >= {sql_str(start_dt)}
                     dimensions,
                     source_time,
                     row.get("publish_mode", "") or default_mode,
+                    rule_fingerprint,
                 )
             )
     return identities
@@ -805,6 +954,7 @@ def build_alert_sql(
     ex_prompt: str = "",
     run_id: str = "",
     idempotency_key: str = "",
+    rule_fingerprint: str = "",
     publish_mode: str = "",
     pipeline_version: str = PIPELINE_VERSION,
     code_fingerprint: str = "",
@@ -852,12 +1002,14 @@ from(
                     'data_period', {sql_str(now.strftime('%Y-%m-%d'))},
                     'alert_time', {sql_str(now.strftime('%Y-%m-%d %H:%M:%S'))},
                     'detail', {sql_str(detail)},
+                    'dimensions', {sql_str(dimensions)},
                     'detector', {sql_str(alert.main_detector)},
                     'confidence', {sql_str(f'{alert.confidence:.3f}')},
                     'ex_prompt', {sql_str(prompt_text)},
                     'source_time', {sql_str(alert.current_time)},
                     'run_id', {sql_str(run_id)},
                     'idempotency_key', {sql_str(idempotency_key)},
+                    'rule_fingerprint', {sql_str(rule_fingerprint)},
                     'publish_mode', {sql_str(publish_mode)},
                     'pipeline_version', {sql_str(pipeline_version)},
                     'code_fingerprint', {sql_str(code_fingerprint)}
@@ -965,6 +1117,13 @@ def detect_selected_alerts(
         enable_low_base_downgrade=low_base_downgrade,
         detector_config=detector_config,
     )
+    three_sigma_severity = (detector_config or {}).get("three_sigma", {}).get("severity_override", "")
+    if three_sigma_severity:
+        for alert in alerts:
+            if alert.main_detector == "three_sigma" and alert.is_anomaly:
+                alert.severity = three_sigma_severity
+                alert.final_alert = True
+                alert.convergence_notes.append(f"按元数据配置强制 3σ 告警等级为{three_sigma_severity}")
     selected: List[det.SeriesAlert] = []
     for alert in alerts:
         if not (alert.final_alert and alert.severity in publish_levels and alert.main_detector):
@@ -1043,7 +1202,8 @@ def publish_alerts_for_rows(
         if not times:
             continue
         dims = fmt_dims(alert.dimensions)
-        idempotency_key = build_alert_idempotency_key(task_name, alert, publish_mode)
+        rule_fingerprint = build_rule_fingerprint(alert.metric, alert.main_detector, alert.severity, ex_prompt)
+        idempotency_key = build_alert_idempotency_key(task_name, alert, publish_mode, ex_prompt)
         if execute and not force_republish and idempotency_key in existing_keys:
             print_step(f"跳过已发布告警 | {business_name} | {dims} | {alert.metric} | key={idempotency_key[:12]}")
             continue
@@ -1081,6 +1241,7 @@ def publish_alerts_for_rows(
             ex_prompt=ex_prompt,
             run_id=run_id,
             idempotency_key=idempotency_key,
+            rule_fingerprint=rule_fingerprint,
             publish_mode=publish_mode,
             pipeline_version=pipeline_version,
             code_fingerprint=code_fingerprint,
@@ -1120,6 +1281,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("input", nargs="?", help="CSV/TSV input file. Omit when using --from-metadata.")
     parser.add_argument("--from-metadata", action="store_true", help="Read active business metadata from ODPS and execute each data_sql.")
     parser.add_argument("--metadata-sql", default=DEFAULT_METADATA_SQL, help="SQL used by --from-metadata to load business metadata.")
+    parser.add_argument("--metadata-id", default="", help="Optional exact metadata ID filter. Multiple values may be comma-separated.")
+    parser.add_argument("--metadata-business-name", default="", help="Optional exact metadata business_name filter. Multiple values may be comma-separated.")
+    parser.add_argument("--metadata-metric-name", default="", help="Optional exact metadata metric_name filter. Multiple values may be comma-separated.")
     parser.add_argument("--time-col", default="日期")
     parser.add_argument("--dimension-cols", default="")
     parser.add_argument("--metric-cols", default="")
@@ -1215,6 +1379,14 @@ def process_metadata_item(
     detection_algor = meta.detection_algor or option_value(prompt_options, "detectors", "检测算法", "使用算法", "detection_algor", "算法") or args.detectors
     threshold_only = is_threshold_only_mode(detection_algor)
     detector_config = None if threshold_only else detector_config_from_text(detection_algor)
+    detector_config = apply_detector_prompt_options(detector_config, prompt_options)
+    if detector_config and detector_config.get("three_sigma", {}).get("enabled"):
+        sigma_config = detector_config["three_sigma"]
+        severity_text = sigma_config.get("severity_override", "auto")
+        print_step(
+            f"检测参数 | {business_label} | three_sigma.threshold={sigma_config.get('threshold', 3.0)} | "
+            f"severity={severity_text}"
+        )
     granularity = monitor_period_to_granularity(meta.monitor_period, args.granularity)
     effective_period = prompt_period(prompt_options, args.period)
     effective_low_base = prompt_low_base_downgrade(prompt_options, meta.ex_prompt, args.low_base_downgrade == "on")
@@ -1336,13 +1508,30 @@ def run_from_metadata(args: argparse.Namespace, config: Dict[str, str], output_d
         print(f"[CHECKPOINT] {state_path}")
 
     print_step("读取元数据配置")
-    metadata_sql = apply_metadata_period_filter(args.metadata_sql, args.monitor_period)
+    print(
+        f"[METADATA_FILTER] period={args.monitor_period or '*'} | id={args.metadata_id or '*'} | "
+        f"business_name={args.metadata_business_name or '*'} | metric_name={args.metadata_metric_name or '*'}",
+        flush=True,
+    )
+    metadata_sql = apply_metadata_filters(
+        args.metadata_sql,
+        monitor_period=args.monitor_period,
+        metadata_ids=args.metadata_id,
+        business_names=args.metadata_business_name,
+        metric_names=args.metadata_metric_name,
+    )
     print_sql_block("元数据SQL", metadata_sql)
     metadata_items = load_active_metadata(config, metadata_sql)
     pending_items = [
         (index, meta)
         for index, meta in enumerate(metadata_items)
         if (not args.monitor_period or monitor_period_matches(meta.monitor_period, args.monitor_period))
+        and metadata_matches_filters(
+            meta,
+            metadata_ids=args.metadata_id,
+            business_names=args.metadata_business_name,
+            metric_names=args.metadata_metric_name,
+        )
         and bool(meta.data_sql)
     ]
     if not pending_items:
