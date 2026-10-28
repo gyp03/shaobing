@@ -222,7 +222,7 @@ def render_jpg(
         baseline_std = (sum((value - baseline_mean) ** 2 for value in history) / len(history)) ** 0.5
         if baseline_std:
             upper_bound = baseline_mean + 3 * baseline_std
-            lower_bound = baseline_mean - 3 * baseline_std
+            lower_bound = max(0.0, baseline_mean - 3 * baseline_std)
             ax.axhspan(lower_bound, upper_bound, color="#eef6ff", alpha=0.75)
             ax.axhline(upper_bound, color="#dc2626", linestyle=(0, (5, 3)), linewidth=1.2)
             ax.axhline(lower_bound, color="#dc2626", linestyle=(0, (5, 3)), linewidth=1.2)

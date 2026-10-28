@@ -262,7 +262,7 @@ history = values[:-1]
 mean = mean(history)
 std = population_std(history)
 z_score = (current - mean) / std
-lower = mean - threshold * std
+lower = max(0, mean - threshold * std)
 upper = mean + threshold * std
 ```
 
@@ -272,7 +272,7 @@ upper = mean + threshold * std
 abs(z_score) > threshold
 ```
 
-默认：`threshold = 3.0`，即当前值超出历史均值 `±3σ` 范围时告警。
+默认：`threshold = 3.0`，即当前值超出历史均值 `±3σ` 范围时告警。业务量、时长等非负指标的统计下限若小于 `0`，展示和判断时强制按 `0` 处理。
 
 可在 `ex_prompt` 中按指标自定义 σ 倍数：
 

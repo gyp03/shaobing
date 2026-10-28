@@ -260,7 +260,7 @@ def detect_three_sigma(values: Sequence[float], cfg: Dict[str, Any]) -> Detectio
         direction = "高于" if z_score > 0 else "低于"
         change_pct = abs(current - baseline_mean) / abs(baseline_mean) * 100 if baseline_mean != 0 else 0.0
         upper = baseline_mean + threshold * baseline_std
-        lower = baseline_mean - threshold * baseline_std
+        lower = max(0.0, baseline_mean - threshold * baseline_std)
         return DetectionResult(
             name,
             True,
